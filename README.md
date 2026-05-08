@@ -1,4 +1,4 @@
-# WashingtonTunneling — MCR/VFD Communication POC
+# TunnelPower (Washington Tunneling) — MCR/VFD Communication POC
 
 Proof of concept for ESP32 ↔ LS Electric GK3000 VFD communication over Modbus RTU (RS-485),
 with MCR aux contact reading and a simple FSM to drive RUN/STOP.

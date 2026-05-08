@@ -103,5 +103,5 @@ void loop() {
             break;
     }
 
-    delay(100); // delay MCR polling every 100mssuf, which is sufficient for relay-speed transitions
+    delay(100); // poll MCR every 100ms
 }
