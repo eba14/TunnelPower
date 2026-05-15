@@ -21,7 +21,6 @@
 // --- GK3000 Modbus RTU frames (slave address 0x01) ---
 // Function code 0x06 = Write Single Register
 // Register 0x2000 = command word: 0x0001 = RUN, 0x0005 = STOP
-// Last 2 bytes = CRC16
 const uint8_t MODBUS_RUN[]  = {0x01, 0x06, 0x20, 0x00, 0x00, 0x01, 0x43, 0xCA};
 const uint8_t MODBUS_STOP[] = {0x01, 0x06, 0x20, 0x00, 0x00, 0x05, 0x42, 0x09};
 
@@ -29,18 +28,15 @@ const uint8_t MODBUS_STOP[] = {0x01, 0x06, 0x20, 0x00, 0x00, 0x05, 0x42, 0x09};
 enum class State { IDLE, RUNNING };
 State currentState = State::IDLE;
 
-// UART2 used for VFD communication (UART0 = USB debug Serial)
-HardwareSerial vfdSerial(2);
+HardwareSerial vfdSerial(2);  // UART2 for VFD (UART0 = USB debug Serial)
 
 // --- Send a Modbus RTU frame over RS-485 ---
-// Toggles DE/RE pin HIGH for transmit, then LOW to return to receive mode
 void rs485Send(const uint8_t *frame, size_t len) {
     digitalWrite(RS485_DE_PIN, HIGH);
     vfdSerial.write(frame, len);
-    vfdSerial.flush();                  // wait until all bytes are sent
-    digitalWrite(RS485_DE_PIN, LOW);    // back to receive so we can read VFD response
+    vfdSerial.flush();                 // waits until all bytes are transmitted
+    digitalWrite(RS485_DE_PIN, LOW);  // switch back to receive mode
 
-    // Print frame to Serial Monitor for debugging
     Serial.print("[Modbus TX] ");
     for (size_t i = 0; i < len; i++) {
         if (frame[i] < 0x10) Serial.print("0");
@@ -52,7 +48,7 @@ void rs485Send(const uint8_t *frame, size_t len) {
 
 // --- FSM transition: IDLE → RUNNING ---
 void sendRUN() {
-    digitalWrite(VFD_X1_PIN, HIGH);         // hardwire backup signal to VFD X1
+    digitalWrite(VFD_X1_PIN,     HIGH);
     digitalWrite(STATUS_LED_PIN, HIGH);
     rs485Send(MODBUS_RUN, sizeof(MODBUS_RUN));
     Serial.println("[FSM] -> RUNNING: Modbus RUN sent, X1 HIGH");
@@ -60,7 +56,7 @@ void sendRUN() {
 
 // --- FSM transition: RUNNING → IDLE ---
 void sendSTOP() {
-    digitalWrite(VFD_X1_PIN, LOW);
+    digitalWrite(VFD_X1_PIN,     LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
     rs485Send(MODBUS_STOP, sizeof(MODBUS_STOP));
     Serial.println("[FSM] -> IDLE: Modbus STOP sent, X1 LOW");
@@ -68,14 +64,13 @@ void sendSTOP() {
 
 void setup() {
     Serial.begin(115200);
-    vfdSerial.begin(9600, SERIAL_8N1, VFD_RX_PIN, VFD_TX_PIN); // match GK3000 P14.01
+    vfdSerial.begin(9600, SERIAL_8N1, VFD_RX_PIN, VFD_TX_PIN);
 
     pinMode(MCR_INPUT_PIN,  INPUT);
     pinMode(RS485_DE_PIN,   OUTPUT);
     pinMode(VFD_X1_PIN,     OUTPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
 
-    // Safe default state — VFD stopped, RS-485 in receive mode
     digitalWrite(RS485_DE_PIN,   LOW);
     digitalWrite(VFD_X1_PIN,     LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
@@ -84,7 +79,6 @@ void setup() {
 }
 
 void loop() {
-    // Read MCR aux contact (HIGH = MCR energized = motor should run)
     bool mcrActive = digitalRead(MCR_INPUT_PIN) == HIGH;
 
     switch (currentState) {
@@ -103,5 +97,5 @@ void loop() {
             break;
     }
 
-    delay(100); // poll MCR every 100ms
+    delay(100);  // poll MCR every 100ms — fast enough for relay-speed transitions
 }
