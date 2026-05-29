@@ -2,9 +2,9 @@
 // Target: ESP32 (PlatformIO esp32dev env)
 //
 // Flow:
-//   MCR aux contact (24V via voltage divider) → GPIO 34
-//   ESP32 FSM reads MCR state and sends:
-//     - Modbus RTU RUN/STOP over RS-485 (UART2) to GK3000 VFD
+//   MCR (Motor Control Relay) aux contact (24V via voltage divider) → GPIO (General Purpose Input/Output) 34
+//   ESP32 FSM (Finite State Machine) reads MCR state and sends:
+//     - Modbus RTU (Remote Terminal Unit) RUN/STOP over RS-485 via UART (Universal Asynchronous Receiver Transmitter) to GK3000 VFD (Variable Frequency Drive)
 //     - Digital RUN/STOP signal to VFD X1 terminal (hardwire backup)
 // ------------------------------------------------------------
 
@@ -12,13 +12,13 @@
 
 // --- Pin assignments ---
 #define MCR_INPUT_PIN   34  // MCR aux contact: 24V → 6.8kΩ/3.3kΩ divider → 3.3V
-#define RS485_DE_PIN     4  // MAX485 DE+RE tied together (HIGH=transmit, LOW=receive)
+#define RS485_DE_PIN     4  // MAX485 DE+RE (Direction Enable/Receiver Enable) tied together (HIGH=transmit, LOW=receive)
 #define VFD_TX_PIN      17  // UART2 TX → MAX485 DI → VFD RS-485
 #define VFD_RX_PIN      16  // UART2 RX ← MAX485 RO ← VFD RS-485
 #define VFD_X1_PIN      26  // Digital out → VFD X1 terminal (hardwire RUN/STOP backup)
 #define STATUS_LED_PIN   2  // Onboard LED: HIGH = motor running
 
-// --- GK3000 Modbus RTU frames (slave address 0x01) ---
+// --- GK3000 Modbus RTU frames (device address 0x01) ---
 // Function code 0x06 = Write Single Register
 // Register 0x2000 = command word: 0x0001 = RUN, 0x0005 = STOP
 const uint8_t MODBUS_RUN[]  = {0x01, 0x06, 0x20, 0x00, 0x00, 0x01, 0x43, 0xCA};
@@ -34,7 +34,7 @@ HardwareSerial vfdSerial(2);  // UART2 for VFD (UART0 = USB debug Serial)
 void rs485Send(const uint8_t *frame, size_t len) {
     digitalWrite(RS485_DE_PIN, HIGH);
     vfdSerial.write(frame, len);
-    vfdSerial.flush();                 // waits until all bytes are transmitted
+    vfdSerial.flush();                // waits until all bytes are transmitted
     digitalWrite(RS485_DE_PIN, LOW);  // switch back to receive mode
 
     Serial.print("[Modbus TX] ");
@@ -75,7 +75,7 @@ void setup() {
     digitalWrite(VFD_X1_PIN,     LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    Serial.println("[BOOT] POC ready — waiting for MCR signal");
+    Serial.println("[BOOT] POC (Proof of Concept) ready — waiting for MCR signal");
 }
 
 void loop() {

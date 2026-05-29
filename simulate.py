@@ -1,12 +1,12 @@
 # ------------------------------------------------------------
-# simulate.py — PC simulation of ESP32 MCR/VFD FSM
+# simulate.py — PC (Personal Computer) simulation of ESP32 MCR (Motor Control Relay)/VFD (Variable Frequency Drive) FSM (Finite State Machine)
 #
 # Simulates real VFD behavior:
 #   - Accel ramp from 0Hz to target frequency
 #   - Decel ramp from current frequency back to 0Hz
-#   - Modbus RTU frames for RUN, STOP, and frequency setpoint
-#   - Simulated VFD acknowledgment (Modbus RX)
-#   - RPM output derived from output frequency
+#   - Modbus RTU (Remote Terminal Unit) frames for RUN, STOP, and frequency setpoint
+#   - Simulated VFD acknowledgment (Modbus RX (Receive))
+#   - RPM (Revolutions Per Minute) output derived from output frequency
 #
 # FSM states: IDLE → ACCEL → RUNNING → DECEL → IDLE
 #
@@ -28,7 +28,7 @@ def crc16(data):
     return [crc & 0xFF, crc >> 8]
 
 def build_frame(register, value):
-    # FC 0x06 = Write Single Register, slave address 0x01
+    # FC 0x06 = Write Single Register, device address 0x01
     frame = [0x01, 0x06, register >> 8, register & 0xFF, value >> 8, value & 0xFF]  # addr, FC, reg hi, reg lo, val hi, val lo
     return frame + crc16(frame)
 
@@ -39,7 +39,7 @@ def hz_to_rpm(hz):
     # Synchronous RPM with ~3% slip for a standard induction motor
     return int((120 * hz / POLES) * 0.97)
 
-# --- GK3000 Modbus RTU frames (slave addr 0x01) ---
+# --- GK3000 Modbus RTU frames (device addr 0x01) ---
 # Register 0x2000 = command word
 # Register 0x2001 = frequency setpoint (unit: 0.01 Hz, so 6000 = 60.00 Hz)
 MODBUS_RUN  = build_frame(0x2000, 0x0001)
@@ -70,7 +70,7 @@ def run_fsm():
     current_hz = 0.0
     target_hz  = 40.0   # default setpoint
 
-    print("[BOOT] POC ready (SIMULATION MODE)")
+    print("[BOOT] POC (Proof of Concept) ready (SIMULATION MODE)")
     print(f"  Default target frequency: {target_hz} Hz")
     print("  Commands:")
     print("    '1'      = MCR ON  (start motor)")
