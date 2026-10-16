@@ -10,16 +10,23 @@ commanded RUN first, then the cutter (VFD1) after a short lead delay — matchin
 the panel's hardware interlock where VFD2's relay output feeds VFD1's program/start-permit pin.
 On stop, the cutter is commanded STOP first (removing the load) and the pump second.
 
+Cutter speed is set by sending `F <hz>` over USB Serial (e.g. `F 45.5`) at any time — a
+bring-up/test input, not the final remote-operator interface.
+
 ---
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.cpp` | ESP32 firmware — hardware I/O (RS-485 transmit/receive) and the FSM |
+| `src/main.cpp` | ESP32 firmware — RS-485 transport, Serial speed command, and the FSM |
 | `src/config.h` | Pin assignments, Modbus addresses/registers, timing constants |
 | `src/modbus_protocol.h` | CRC16, frame building, response validation — no Arduino dependency |
-| `test/test_modbus_protocol.cpp` | Native (PC) test of `modbus_protocol.h`/`config.h` — see Testing section |
+| `src/modbus_command.h` | Retry/timeout orchestration over an `Rs485Transport` — no Arduino dependency |
+| `src/rs485_transport.h` | `Rs485Transport` interface — real UART on ESP32, fake VFD in tests |
+| `test/test_modbus_protocol.cpp` | Native (PC) test of the protocol logic — see Testing section |
+| `test/test_modbus_command.cpp` | Native (PC) test of retry/timeout logic against a fake VFD — see Testing section |
+| `test/fake_rs485_transport.h` | Fake VFD used by `test_modbus_command.cpp` (healthy / dead / noisy / rejecting / intermittent) |
 | `simulate.py` | PC simulator — run without hardware to verify FSM logic, dual-VFD sequencing, Modbus frames, S-curve ramp, and RPM (Revolutions Per Minute) output |
 | `platformio.ini` | PlatformIO build config for the ESP32 (`esp32dev`) target |
 
@@ -85,8 +92,9 @@ at all), since confirming a command actually landed is worth a short bounded sta
 Register addresses are from the official LS Electric S100 manual, section 7.4 "Compatible
 Common Area Parameter" (p.289) — not assumed. `0x0006` ("Operation command") is a bitfield;
 only the low bits matter for RUN/STOP (B0=Stop, B1=Forward run). `0x0005` ("Command
-frequency", 0.01 Hz units) is defined in `config.h` but not yet written by the firmware — only
-`simulate.py` exercises it, for ramp/RPM demonstration purposes.
+frequency", 0.01 Hz units) is written by `setCutterFrequency()` in `main.cpp` in response to
+the `F <hz>` Serial command, clamped to `VFD1_MIN_CENTIHERTZ`/`VFD1_MAX_CENTIHERTZ`
+(0–60 Hz) regardless of what the caller passes in.
 
 Frames are built at runtime from `buildModbusFrame()`/`modbusCRC16()` in `modbus_protocol.h`
 (and the equivalent in `simulate.py`) rather than hand-typed, so a transcription error can't
@@ -110,15 +118,12 @@ Parameters" p.275 — not the generic placeholder codes an earlier revision of t
 | Group.Code | LCD Display | VFD1 (cutter) | VFD2 (pump) | Description |
 |---|---|---|---|---|
 | DRV-06 | Cmd Source | 3 (Int 485) | 3 (Int 485) | **Required** — without this the VFD ignores Modbus RUN/STOP entirely and listens to the keypad/terminal instead. Not the factory default. |
+| Frq (Operation group) | Freq Ref Src | 6 (Int 485) | — | **Required on VFD1** for `F <hz>` to have any effect — without it the VFD ignores the frequency register and keeps using its keypad/analog setpoint. Not the factory default. VFD2 doesn't need this (fixed-speed pump, no setpoint written). |
 | CM.01 | Int485 St ID | 1 | 2 | Station address — must match `VFD1_ADDR`/`VFD2_ADDR` in `config.h` |
 | CM.02 | Int485 Proto | 0 (Modbus RTU) | 0 (Modbus RTU) | Factory default already matches |
 | CM.03 | Int485 BaudR | 3 (9600 bps) | 3 (9600 bps) | Must match `vfdSerial.begin(9600, ...)` |
 | CM.04 | Int485 Mode | 0 (D8/PN/S1) | 0 (D8/PN/S1) | 8 data bits, no parity, 1 stop — matches `SERIAL_8N1` |
 | CM.05 | Resp Delay | 5 ms (default) | 5 ms (default) | VFD's reply delay — well within `RESPONSE_TIMEOUT_MS` (50ms) |
-
-Frequency reference source (the `Frq` code, Operation group) isn't set to Modbus here, since
-the firmware doesn't write the frequency register yet — leave it on Keypad and set the desired
-Hz manually on each VFD until setpoint control is added to `main.cpp`.
 
 ---
 
@@ -165,23 +170,38 @@ RPM = (120 × Hz / poles) × 0.97
 
 ---
 
-## Testing (`test/test_modbus_protocol.cpp`)
+## Testing
 
-A native (PC) test of the actual `config.h`/`modbus_protocol.h` the ESP32 build compiles —
-not a reimplementation. Covers CRC correctness, exact-echo success, timeout, a corrupted
-echo, a well-formed Modbus exception reply, an exception reply with a bad CRC (must not be
-trusted), and that the RUN/STOP frames target the verified register (`0x0006`) and values.
-
-Requires a PC C++ compiler (e.g. MSYS2's `g++`, not PlatformIO's ESP32 toolchain):
+Two native (PC) test suites run against the actual source the ESP32 build compiles — not
+reimplementations. Requires a PC C++ compiler (e.g. MSYS2's `g++`, not PlatformIO's ESP32
+toolchain):
 ```
 g++ -std=c++17 -Wall -Wextra test/test_modbus_protocol.cpp -o test/test_modbus_protocol.exe
+g++ -std=c++17 -Wall -Wextra test/test_modbus_command.cpp -o test/test_modbus_command.exe
 ./test/test_modbus_protocol.exe
+./test/test_modbus_command.exe
 ```
 
-What this does **not** test: real UART timing, RS-485 bus behavior, or anything involving an
-actual VFD — `rs485Transmit`/`rs485Receive` in `main.cpp` are hardware-dependent and untested
-by this harness. `simulate.py` always takes the happy path (it fakes a perfect echo), so
-neither tool has exercised the ACK/timeout/retry logic against real serial hardware yet.
+**`test_modbus_protocol.cpp`** — CRC correctness, exact-echo success, timeout, a corrupted
+echo, a well-formed Modbus exception reply, an exception reply with a bad CRC (must not be
+trusted), that RUN/STOP/frequency frames target the verified registers and values, and the
+frequency clamp (`clampInt`) at and past both bounds.
+
+**`test_modbus_command.cpp`** — exercises the retry/timeout orchestration itself (not just
+frame validation) against `FakeRs485Transport`, a fake VFD configurable to behave like a
+healthy drive, a dead one, a noisy line (corrupted replies), a drive that explicitly rejects
+the register, or one with a transient glitch that clears partway through the retry budget.
+This is what caught a real behavioral bug while building it: the original retry loop retried
+on *every* failure including a Modbus exception — but an exception means the VFD understood
+the request and explicitly refused it (e.g. wrong register), so retrying the identical frame
+can't produce a different result. `sendModbusCommand()` now fails fast on `EXCEPTION` and
+only retries `TIMEOUT`/`MISMATCH`, the failure modes retrying can plausibly fix.
+
+What this does **not** test: real UART timing or actual RS-485 electrical behavior — the
+`Esp32Rs485Transport` class in `main.cpp` that talks to real hardware is itself untested by
+either harness. `simulate.py` also always takes the happy path (it fakes a perfect echo), so
+no tool here has exercised this logic against real serial hardware yet — only a real VFD can
+confirm that.
 
 ---
 
@@ -198,6 +218,13 @@ Expected boot output:
 ```
 [BOOT] POC ready — waiting for MCR signal
 ```
+
+To set cutter speed, type into the Serial Monitor's send line (Enter-terminated) at any time:
+```
+F 45.5
+```
+Requires VFD1's `Frq` keypad parameter set to `6` (Int 485) — see VFD Parameters above — or
+the write succeeds on the bus but the VFD ignores the value.
 
 ---
 

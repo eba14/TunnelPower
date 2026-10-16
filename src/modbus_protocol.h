@@ -27,6 +27,12 @@ inline void buildModbusFrame(uint8_t *out, uint8_t addr, uint16_t reg, uint16_t 
     out[7] = crc >> 8;
 }
 
+inline int clampInt(int value, int min, int max) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+}
+
 enum class ModbusResult { OK, TIMEOUT, MISMATCH, EXCEPTION };
 
 inline const char *resultToString(ModbusResult result) {

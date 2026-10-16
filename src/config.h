@@ -24,6 +24,12 @@
 // B5-B14 report command/frequency source (keypad/terminal/485) and are read-only on this
 // register -- source is set once via keypad, not re-written per command.
 
+// Cutter (VFD1) frequency setpoint bounds, in 0.01 Hz units (register 0x0005 scale).
+// Requires VFD1's "Frq" (Frequency reference source, Operation group) keypad parameter
+// set to 6 (Int 485) -- otherwise the VFD ignores this register regardless of what's written.
+#define VFD1_MIN_CENTIHERTZ 0     // 0.00 Hz
+#define VFD1_MAX_CENTIHERTZ 6000  // 60.00 Hz
+
 #define FRAME_LEN 8  // 6 data bytes + 2 CRC bytes
 
 // --- Sequencing timing (non-blocking, tracked via millis()) ---

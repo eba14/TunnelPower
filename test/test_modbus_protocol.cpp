@@ -58,6 +58,22 @@ int main() {
     buildModbusFrame(vfd1Stop, 0x01, REG_OPERATION_COMMAND, CMD_STOP);
     check(vfd1Stop[5] == 0x01, "VFD1 STOP frame writes CMD_STOP (0x0001), i.e. bit0");
 
+    // Frequency setpoint: 45.00 Hz -> 4500 (0x1194) at register 0x0005, 0.01 Hz units.
+    uint8_t freq45[8];
+    buildModbusFrame(freq45, VFD1_ADDR, REG_COMMAND_FREQUENCY, 4500);
+    check(freq45[2] == 0x00 && freq45[3] == 0x05, "frequency frame targets register 0x0005");
+    check(freq45[4] == 0x11 && freq45[5] == 0x94, "45.00 Hz encodes as 0x1194 (4500 x 0.01Hz)");
+
+    // setCutterFrequency's clamp (src/main.cpp) delegates to this -- verify the bounds directly.
+    check(clampInt(-100, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == VFD1_MIN_CENTIHERTZ,
+          "negative Hz clamps to VFD1_MIN_CENTIHERTZ (0)");
+    check(clampInt(9999, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == VFD1_MAX_CENTIHERTZ,
+          "over-range Hz clamps to VFD1_MAX_CENTIHERTZ (6000 = 60.00 Hz)");
+    check(clampInt(4500, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == 4500,
+          "in-range Hz passes through unclamped");
+    check(clampInt(VFD1_MAX_CENTIHERTZ, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == VFD1_MAX_CENTIHERTZ,
+          "exact upper bound (60.00 Hz) passes through unclamped");
+
     std::printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED");
     return failures == 0 ? 0 : 1;
 }
