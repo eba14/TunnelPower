@@ -1,8 +1,14 @@
 # TunnelPower (Washington Tunneling) — MCR/VFD Communication POC
 
-Proof of Concept (POC) for ESP32 ↔ LS Electric GK3000 VFD (Variable Frequency Drive) communication over Modbus RTU (Remote Terminal Unit) via RS-485.
-The ESP32 reads an MCR (Motor Control Relay) auxiliary contact and drives the VFD RUN/STOP
-via Modbus, with a hardwire backup signal on the VFD X1 terminal.
+Proof of Concept (POC) for ESP32 ↔ LS Electric VFD (Variable Frequency Drive) communication over Modbus RTU (Remote Terminal Unit) via RS-485, controlling both drives on the panel:
+- **VFD1** (addr 1, `LSLV0220S100-4EOFNS`) — cutter motor
+- **VFD2** (addr 2, `LSLV0004S100-4EOFNS`) — water pump
+
+The ESP32 reads an MCR (Motor Control Relay) auxiliary contact and drives both VFDs' RUN/STOP
+via Modbus, with a hardwire backup signal on VFD1's X1 terminal. On start, the pump (VFD2) is
+commanded RUN first, then the cutter (VFD1) after a short lead delay — matching, in software,
+the panel's hardware interlock where VFD2's relay output feeds VFD1's program/start-permit pin.
+On stop, the cutter is commanded STOP first (removing the load) and the pump second.
 
 ---
 
@@ -10,9 +16,12 @@ via Modbus, with a hardwire backup signal on the VFD X1 terminal.
 
 | File | Purpose |
 |---|---|
-| `src/main.cpp` | ESP32 firmware — reads MCR input, sends Modbus RUN/STOP to GK3000 over RS-485 |
-| `simulate.py` | PC simulator — run without hardware to verify FSM (Finite State Machine) logic, Modbus frames, S-curve ramp, and RPM (Revolutions Per Minute) output |
-| `platformio.ini` | PlatformIO build config for ESP32 (`esp32dev`) and native PC (`native`) targets |
+| `src/main.cpp` | ESP32 firmware — hardware I/O (RS-485 transmit/receive) and the FSM |
+| `src/config.h` | Pin assignments, Modbus addresses/registers, timing constants |
+| `src/modbus_protocol.h` | CRC16, frame building, response validation — no Arduino dependency |
+| `test/test_modbus_protocol.cpp` | Native (PC) test of `modbus_protocol.h`/`config.h` — see Testing section |
+| `simulate.py` | PC simulator — run without hardware to verify FSM logic, dual-VFD sequencing, Modbus frames, S-curve ramp, and RPM (Revolutions Per Minute) output |
+| `platformio.ini` | PlatformIO build config for the ESP32 (`esp32dev`) target |
 
 ---
 
@@ -20,61 +29,96 @@ via Modbus, with a hardwire backup signal on the VFD X1 terminal.
 
 | Signal | ESP32 Pin | Notes |
 |---|---|---|
-| MCR aux contact | GPIO 34 | 24V → voltage divider → 3.3V |
+| MCR aux contact | GPIO 34 | 24V → voltage divider → ~3.1V |
 | RS-485 DE/RE (Direction Enable/Receiver Enable) | GPIO 4 | MAX485 direction control |
 | VFD TX (UART2 — Universal Asynchronous Receiver Transmitter) | GPIO 17 | → MAX485 DI (Data Input) |
 | VFD RX (UART2) | GPIO 16 | ← MAX485 RO (Receiver Output) |
-| VFD X1 (digital RUN) | GPIO 26 | Hardwire backup RUN/STOP |
-| Status LED | GPIO 2 | HIGH = running |
+| VFD1 X1 (digital RUN, cutter only) | GPIO 26 | Hardwire backup RUN/STOP for VFD1. VFD2 (pump) has no direct ESP32 hardwire connection — it's Modbus-only, with its own relay output feeding VFD1's program/interlock pin on the panel. |
+| Status LED | GPIO 2 | HIGH = cutter motor running |
 
-### 24V → 3.3V Voltage Divider (MCR input)
+### 24V → ~3.1V Voltage Divider (MCR input)
 ```
 24V ──┬── 6.8kΩ ──┬── GPIO 34
       │           │
-     GND        3.3kΩ
-                  │
-                 GND
+     GND          1kΩ
+                   │
+                  GND
 ```
+6.8kΩ/1kΩ gives 24V × 1k/7.8k ≈ **3.08V** at GPIO 34 — safe under the ESP32's 3.6V absolute
+maximum GPIO input rating. Confirm the physical resistors on the board match 6.8k/1k before
+connecting a live 24V MCR contact.
 
-### MAX485 Connections
+### MAX485 Connections (shared bus — both VFDs multi-drop off one transceiver)
 ```
 ESP32 GPIO 17 (TX) → MAX485 DI
 ESP32 GPIO 16 (RX) → MAX485 RO
 ESP32 GPIO 4       → MAX485 DE + RE (tied together)
-MAX485 A/B         → VFD RS-485 terminals
+MAX485 A/B         → VFD1 RS-485 terminals → VFD2 RS-485 terminals (daisy-chained)
 ```
 
 ---
 
 ## FSM Logic
 
-| State | MCR Input | Action |
+Five states, non-blocking (timed via `millis()`, not `delay()`), with every Modbus command
+verified against the VFD's echoed response (retried up to `MAX_RETRIES` times before the
+command is considered failed):
+
+| State | Trigger | Action |
 |---|---|---|
-| IDLE | Goes HIGH | → RUNNING: Modbus RUN + X1 HIGH |
-| RUNNING | Goes LOW | → IDLE: Modbus STOP + X1 LOW |
+| IDLE | MCR goes HIGH | Send VFD2 (pump) RUN. Confirmed → `PUMP_LEAD_WAIT`. Failed after retries → `FAULT`. |
+| PUMP_LEAD_WAIT | MCR drops | Abort: send VFD2 STOP → back to `IDLE`. |
+| PUMP_LEAD_WAIT | `PUMP_LEAD_MS` elapses (MCR still HIGH) | Send VFD1 (cutter) RUN + X1 HIGH. Confirmed → `RUNNING`. Failed after retries → stop VFD2, go to `FAULT`. |
+| RUNNING | MCR goes LOW | Send VFD1 STOP + X1 LOW (unconditional — doesn't wait on Modbus ack) → `CUTTER_SETTLE_WAIT`. |
+| CUTTER_SETTLE_WAIT | `CUTTER_STOP_SETTLE_MS` elapses | Send VFD2 (pump) STOP → `IDLE`. |
+| FAULT | — | Status LED blinks. Cleared only when MCR cycles back to LOW → `IDLE`. |
+
+Because the waits are non-blocking, a dropped MCR signal is noticed on the next 100ms poll
+even mid-sequence — not after a fixed delay elapses. Individual Modbus transactions remain
+short, bounded blocking calls (typically a few ms; worst case ~150ms if a VFD doesn't respond
+at all), since confirming a command actually landed is worth a short bounded stall.
 
 ---
 
-## Modbus Frames (GK3000 device address 0x01)
+## Modbus Frames
 
-| Command | Register | Value | Frame |
-|---|---|---|---|
-| RUN | 0x2000 | 0x0001 | `01 06 20 00 00 01 43 CA` |
-| STOP | 0x2000 | 0x0005 | `01 06 20 00 00 05 42 09` |
-| Freq setpoint | 0x2001 | 0.01 Hz units | computed via CRC16 (Cyclic Redundancy Check) |
+Register addresses are from the official LS Electric S100 manual, section 7.4 "Compatible
+Common Area Parameter" (p.289) — not assumed. `0x0006` ("Operation command") is a bitfield;
+only the low bits matter for RUN/STOP (B0=Stop, B1=Forward run). `0x0005` ("Command
+frequency", 0.01 Hz units) is defined in `config.h` but not yet written by the firmware — only
+`simulate.py` exercises it, for ramp/RPM demonstration purposes.
+
+Frames are built at runtime from `buildModbusFrame()`/`modbusCRC16()` in `modbus_protocol.h`
+(and the equivalent in `simulate.py`) rather than hand-typed, so a transcription error can't
+silently ship the way the original register addresses once did (see Testing section below).
+
+| VFD | Addr | Command | Register | Value | Frame |
+|---|---|---|---|---|---|
+| VFD1 (cutter) | 0x01 | RUN (forward) | 0x0006 | 0x0002 | `01 06 00 06 00 02 E8 0A` |
+| VFD1 (cutter) | 0x01 | STOP | 0x0006 | 0x0001 | `01 06 00 06 00 01 A8 0B` |
+| VFD1 (cutter) | 0x01 | Freq setpoint example (45.00 Hz) | 0x0005 | 0x1194 | `01 06 00 05 11 94 94 34` |
+| VFD2 (pump) | 0x02 | RUN (forward) | 0x0006 | 0x0002 | `02 06 00 06 00 02 E8 39` |
+| VFD2 (pump) | 0x02 | STOP | 0x0006 | 0x0001 | `02 06 00 06 00 01 A8 38` |
 
 ---
 
-## GK3000 VFD Parameters
-Set these on the VFD keypad before testing:
+## VFD Parameters
+Set these on each VFD's keypad before testing (codes verified against the S100 manual,
+sections 4.5 "Command Source Configuration" p.117 and 7.2 "Setting Communication
+Parameters" p.275 — not the generic placeholder codes an earlier revision of this doc used):
 
-| Parameter | Value | Description |
-|---|---|---|
-| P0.01 | 2 | Command source = RS-485 |
-| P0.03 | 2 | Frequency source = RS-485 |
-| P14.00 | 1 | Device address = 1 |
-| P14.01 | 9600 | Baud rate — must match `vfdSerial.begin()` |
-| P14.02 | 0 | 8N1 format (8 data bits, No parity, 1 stop bit) |
+| Group.Code | LCD Display | VFD1 (cutter) | VFD2 (pump) | Description |
+|---|---|---|---|---|
+| DRV-06 | Cmd Source | 3 (Int 485) | 3 (Int 485) | **Required** — without this the VFD ignores Modbus RUN/STOP entirely and listens to the keypad/terminal instead. Not the factory default. |
+| CM.01 | Int485 St ID | 1 | 2 | Station address — must match `VFD1_ADDR`/`VFD2_ADDR` in `config.h` |
+| CM.02 | Int485 Proto | 0 (Modbus RTU) | 0 (Modbus RTU) | Factory default already matches |
+| CM.03 | Int485 BaudR | 3 (9600 bps) | 3 (9600 bps) | Must match `vfdSerial.begin(9600, ...)` |
+| CM.04 | Int485 Mode | 0 (D8/PN/S1) | 0 (D8/PN/S1) | 8 data bits, no parity, 1 stop — matches `SERIAL_8N1` |
+| CM.05 | Resp Delay | 5 ms (default) | 5 ms (default) | VFD's reply delay — well within `RESPONSE_TIMEOUT_MS` (50ms) |
+
+Frequency reference source (the `Frq` code, Operation group) isn't set to Modbus here, since
+the firmware doesn't write the frequency register yet — leave it on Keypad and set the desired
+Hz manually on each VFD until setpoint control is added to `main.cpp`.
 
 ---
 
@@ -97,13 +141,18 @@ python simulate.py
 **Example output:**
 ```
 Command: 1
-[Modbus TX] 01 06 20 00 00 01 43 CA  (RUN command)
-[Modbus RX] 01 06 20 00 00 01 43 CA  <- VFD acknowledged
-[FSM] -> RUNNING at 40.0 Hz
+[SIM] MCR energized
+[SIM] VFD2 (pump) RUN
+[Modbus TX] 02 06 00 06 00 02 E8 39  (VFD2 addr 2 RUN)
+[Modbus RX] 02 06 00 06 00 02 E8 39  <- VFD2 acknowledged
+  [PUMP] running at 60.0 Hz (fixed)
+[Modbus TX] 01 06 00 06 00 02 E8 0A  (VFD1 addr 1 RUN)
+[Modbus RX] 01 06 00 06 00 02 E8 0A  <- VFD1 acknowledged
   [ACCEL] 1.2 Hz  |  35 RPM
   [ACCEL] 4.9 Hz  |  142 RPM
   ...
   [ACCEL] 40.0 Hz  |  1164 RPM
+[FSM] -> RUNNING at 40.0 Hz  |  1164 RPM
 ```
 
 The ramp uses an **S-curve profile** (sine-based) — slow start, fast middle, slow end —
@@ -113,6 +162,26 @@ RPM is derived from the synchronous speed formula with 3% slip:
 ```
 RPM = (120 × Hz / poles) × 0.97
 ```
+
+---
+
+## Testing (`test/test_modbus_protocol.cpp`)
+
+A native (PC) test of the actual `config.h`/`modbus_protocol.h` the ESP32 build compiles —
+not a reimplementation. Covers CRC correctness, exact-echo success, timeout, a corrupted
+echo, a well-formed Modbus exception reply, an exception reply with a bad CRC (must not be
+trusted), and that the RUN/STOP frames target the verified register (`0x0006`) and values.
+
+Requires a PC C++ compiler (e.g. MSYS2's `g++`, not PlatformIO's ESP32 toolchain):
+```
+g++ -std=c++17 -Wall -Wextra test/test_modbus_protocol.cpp -o test/test_modbus_protocol.exe
+./test/test_modbus_protocol.exe
+```
+
+What this does **not** test: real UART timing, RS-485 bus behavior, or anything involving an
+actual VFD — `rs485Transmit`/`rs485Receive` in `main.cpp` are hardware-dependent and untested
+by this harness. `simulate.py` always takes the happy path (it fakes a perfect echo), so
+neither tool has exercised the ACK/timeout/retry logic against real serial hardware yet.
 
 ---
 
@@ -138,8 +207,9 @@ Expected boot output:
 |---|---|
 | ESP32 DevKit V1 | MCU (Microcontroller Unit) — runs the firmware |
 | Micro-USB cable | Flash firmware from PC |
-| MAX485 module | Converts UART to RS-485 for VFD communication |
-| GK3000 VFD (1hp, 3-phase) | Variable frequency drive |
-| 3-phase induction motor | Load |
+| MAX485 module | Converts UART to RS-485 for VFD communication (shared bus, both VFDs) |
+| VFD1: LS Electric `LSLV0220S100-4EOFNS` | Cutter motor drive |
+| VFD2: LS Electric `LSLV0004S100-4EOFNS` | Pump drive |
+| 3-phase induction motor(s) | Load |
 | MCR relay | Input signal source |
-| 6.8kΩ + 3.3kΩ resistors | Voltage divider for MCR input |
+| 6.8kΩ + 1kΩ resistors | Voltage divider for MCR input |

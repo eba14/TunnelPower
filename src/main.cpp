@@ -1,41 +1,28 @@
-// ------------------------------------------------------------
-// Target: ESP32 (PlatformIO esp32dev env)
-//
-// Flow:
-//   MCR (Motor Control Relay) aux contact (24V via voltage divider) → GPIO (General Purpose Input/Output) 34
-//   ESP32 FSM (Finite State Machine) reads MCR state and sends:
-//     - Modbus RTU (Remote Terminal Unit) RUN/STOP over RS-485 via UART (Universal Asynchronous Receiver Transmitter) to GK3000 VFD (Variable Frequency Drive)
-//     - Digital RUN/STOP signal to VFD X1 terminal (hardwire backup)
-// ------------------------------------------------------------
+// ESP32 firmware (PlatformIO esp32dev). Reads MCR aux contact, sequences VFD1 (cutter) and
+// VFD2 (pump) over Modbus RTU/RS-485, with an X1 hardwire backup for VFD1.
+// Start: pump RUN -> wait PUMP_LEAD_MS -> cutter RUN. Stop: cutter STOP -> wait -> pump STOP.
+// Every write is ACK-verified against the VFD's echoed response and retried on failure.
 
 #include <Arduino.h>
+#include "config.h"
+#include "modbus_protocol.h"
 
-// --- Pin assignments ---
-#define MCR_INPUT_PIN   34  // MCR aux contact: 24V → 6.8kΩ/3.3kΩ divider → 3.3V
-#define RS485_DE_PIN     4  // MAX485 DE+RE (Direction Enable/Receiver Enable) tied together (HIGH=transmit, LOW=receive)
-#define VFD_TX_PIN      17  // UART2 TX → MAX485 DI → VFD RS-485
-#define VFD_RX_PIN      16  // UART2 RX ← MAX485 RO ← VFD RS-485
-#define VFD_X1_PIN      26  // Digital out → VFD X1 terminal (hardwire RUN/STOP backup)
-#define STATUS_LED_PIN   2  // Onboard LED: HIGH = motor running
-
-// --- GK3000 Modbus RTU frames (device address 0x01) ---
-// Function code 0x06 = Write Single Register
-// Register 0x2000 = command word: 0x0001 = RUN, 0x0005 = STOP
-const uint8_t MODBUS_RUN[]  = {0x01, 0x06, 0x20, 0x00, 0x00, 0x01, 0x43, 0xCA};
-const uint8_t MODBUS_STOP[] = {0x01, 0x06, 0x20, 0x00, 0x00, 0x05, 0x42, 0x09};
-
-// --- FSM states ---
-enum class State { IDLE, RUNNING };
+enum class State { IDLE, PUMP_LEAD_WAIT, RUNNING, CUTTER_SETTLE_WAIT, FAULT };
 State currentState = State::IDLE;
+unsigned long stateEnteredAt = 0;
 
-HardwareSerial vfdSerial(2);  // UART2 for VFD (UART0 = USB debug Serial)
+HardwareSerial vfdSerial(2);  // UART2 for VFD bus; UART0 = USB debug Serial
 
-// --- Send a Modbus RTU frame over RS-485 ---
-void rs485Send(const uint8_t *frame, size_t len) {
+uint8_t vfd1RunFrame[FRAME_LEN];
+uint8_t vfd1StopFrame[FRAME_LEN];
+uint8_t vfd2RunFrame[FRAME_LEN];
+uint8_t vfd2StopFrame[FRAME_LEN];
+
+void rs485Transmit(const uint8_t *frame, size_t len) {
     digitalWrite(RS485_DE_PIN, HIGH);
     vfdSerial.write(frame, len);
-    vfdSerial.flush();                // waits until all bytes are transmitted
-    digitalWrite(RS485_DE_PIN, LOW);  // switch back to receive mode
+    vfdSerial.flush();
+    digitalWrite(RS485_DE_PIN, LOW);
 
     Serial.print("[Modbus TX] ");
     for (size_t i = 0; i < len; i++) {
@@ -46,20 +33,79 @@ void rs485Send(const uint8_t *frame, size_t len) {
     Serial.println();
 }
 
-// --- FSM transition: IDLE → RUNNING ---
-void sendRUN() {
-    digitalWrite(VFD_X1_PIN,     HIGH);
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    rs485Send(MODBUS_RUN, sizeof(MODBUS_RUN));
-    Serial.println("[FSM] -> RUNNING: Modbus RUN sent, X1 HIGH");
+// Reads until timeoutMs elapses or the bus is quiet for INTERBYTE_SILENCE_MS (frame boundary).
+size_t rs485Receive(uint8_t *buf, size_t bufLen, unsigned long timeoutMs) {
+    size_t count = 0;
+    unsigned long start = millis();
+    unsigned long lastByteAt = start;
+
+    while (millis() - start < timeoutMs) {
+        if (vfdSerial.available()) {
+            uint8_t b = vfdSerial.read();
+            if (count < bufLen) buf[count++] = b;
+            lastByteAt = millis();
+        } else if (count > 0 && millis() - lastByteAt >= INTERBYTE_SILENCE_MS) {
+            break;
+        }
+    }
+    return count;
 }
 
-// --- FSM transition: RUNNING → IDLE ---
-void sendSTOP() {
-    digitalWrite(VFD_X1_PIN,     LOW);
+void clearRxBuffer() {
+    while (vfdSerial.available()) vfdSerial.read();
+}
+
+ModbusResult sendModbusCommand(const uint8_t *frame, size_t len, const char *label) {
+    ModbusResult result = ModbusResult::TIMEOUT;
+
+    for (uint8_t attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+        clearRxBuffer();
+        rs485Transmit(frame, len);
+
+        uint8_t resp[FRAME_LEN];
+        size_t n = rs485Receive(resp, sizeof(resp), RESPONSE_TIMEOUT_MS);
+        result = evaluateResponse(frame, len, resp, n);
+
+        if (result == ModbusResult::OK) {
+            Serial.print("[Modbus] "); Serial.print(label); Serial.println(" OK");
+            return result;
+        }
+
+        Serial.print("[Modbus] "); Serial.print(label);
+        Serial.print(" attempt "); Serial.print(attempt); Serial.print("/"); Serial.print(MAX_RETRIES + 1);
+        Serial.print(" failed: "); Serial.println(resultToString(result));
+    }
+
+    Serial.print("[Modbus] "); Serial.print(label); Serial.println(" FAILED after all retries");
+    return result;
+}
+
+bool attemptPumpStart() {
+    return sendModbusCommand(vfd2RunFrame, FRAME_LEN, "VFD2 (pump) RUN") == ModbusResult::OK;
+}
+
+bool attemptCutterStart() {
+    bool ok = sendModbusCommand(vfd1RunFrame, FRAME_LEN, "VFD1 (cutter) RUN") == ModbusResult::OK;
+    if (ok) {
+        digitalWrite(VFD1_X1_PIN, HIGH);
+        digitalWrite(STATUS_LED_PIN, HIGH);
+    }
+    return ok;
+}
+
+void attemptCutterStop() {
+    digitalWrite(VFD1_X1_PIN, LOW);     // unconditional: doesn't wait on Modbus ack
     digitalWrite(STATUS_LED_PIN, LOW);
-    rs485Send(MODBUS_STOP, sizeof(MODBUS_STOP));
-    Serial.println("[FSM] -> IDLE: Modbus STOP sent, X1 LOW");
+    sendModbusCommand(vfd1StopFrame, FRAME_LEN, "VFD1 (cutter) STOP");
+}
+
+void attemptPumpStop() {
+    sendModbusCommand(vfd2StopFrame, FRAME_LEN, "VFD2 (pump) STOP");
+}
+
+void enterState(State s) {
+    currentState = s;
+    stateEnteredAt = millis();
 }
 
 void setup() {
@@ -68,14 +114,19 @@ void setup() {
 
     pinMode(MCR_INPUT_PIN,  INPUT);
     pinMode(RS485_DE_PIN,   OUTPUT);
-    pinMode(VFD_X1_PIN,     OUTPUT);
+    pinMode(VFD1_X1_PIN,    OUTPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
 
     digitalWrite(RS485_DE_PIN,   LOW);
-    digitalWrite(VFD_X1_PIN,     LOW);
+    digitalWrite(VFD1_X1_PIN,    LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    Serial.println("[BOOT] POC (Proof of Concept) ready — waiting for MCR signal");
+    buildModbusFrame(vfd1RunFrame,  VFD1_ADDR, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
+    buildModbusFrame(vfd1StopFrame, VFD1_ADDR, REG_OPERATION_COMMAND, CMD_STOP);
+    buildModbusFrame(vfd2RunFrame,  VFD2_ADDR, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
+    buildModbusFrame(vfd2StopFrame, VFD2_ADDR, REG_OPERATION_COMMAND, CMD_STOP);
+
+    Serial.println("[BOOT] POC ready - waiting for MCR signal");
 }
 
 void loop() {
@@ -84,18 +135,56 @@ void loop() {
     switch (currentState) {
         case State::IDLE:
             if (mcrActive) {
-                currentState = State::RUNNING;
-                sendRUN();
+                if (attemptPumpStart()) {
+                    enterState(State::PUMP_LEAD_WAIT);
+                } else {
+                    Serial.println("[FSM] -> FAULT: pump failed to start");
+                    enterState(State::FAULT);
+                }
+            }
+            break;
+
+        case State::PUMP_LEAD_WAIT:
+            if (!mcrActive) {
+                Serial.println("[FSM] MCR dropped during pump lead - aborting start");
+                attemptPumpStop();
+                enterState(State::IDLE);
+            } else if (millis() - stateEnteredAt >= PUMP_LEAD_MS) {
+                if (attemptCutterStart()) {
+                    Serial.println("[FSM] -> RUNNING");
+                    enterState(State::RUNNING);
+                } else {
+                    Serial.println("[FSM] -> FAULT: cutter failed to start; stopping pump");
+                    attemptPumpStop();
+                    enterState(State::FAULT);
+                }
             }
             break;
 
         case State::RUNNING:
             if (!mcrActive) {
-                currentState = State::IDLE;
-                sendSTOP();
+                attemptCutterStop();
+                enterState(State::CUTTER_SETTLE_WAIT);
+            }
+            break;
+
+        case State::CUTTER_SETTLE_WAIT:
+            if (millis() - stateEnteredAt >= CUTTER_STOP_SETTLE_MS) {
+                attemptPumpStop();
+                Serial.println("[FSM] -> IDLE");
+                enterState(State::IDLE);
+            }
+            break;
+
+        case State::FAULT:
+            digitalWrite(STATUS_LED_PIN, ((millis() / 250) % 2) ? HIGH : LOW);
+            if (!mcrActive) {
+                digitalWrite(STATUS_LED_PIN, LOW);
+                Serial.println("[FSM] FAULT cleared (MCR cycled) -> IDLE");
+                enterState(State::IDLE);
             }
             break;
     }
 
-    delay(100);  // poll MCR every 100ms — fast enough for relay-speed transitions
+    delay(100);
 }
