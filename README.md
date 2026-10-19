@@ -1,7 +1,7 @@
 # TunnelPower (Washington Tunneling) — MCR/VFD Communication POC
 
 Proof of Concept (POC) for ESP32 ↔ LS Electric VFD (Variable Frequency Drive) communication over Modbus RTU (Remote Terminal Unit) via RS-485, controlling both drives on the panel:
-- **VFD1** (addr 1, `LSLV0220S100-4EOFNS`) — cutter motor
+- **VFD1** (addr 1, `LSLV0220S100-4EXNNS`) — cutter motor
 - **VFD2** (addr 2, `LSLV0004S100-4EOFNS`) — water pump
 
 The ESP32 reads an MCR (Motor Control Relay) auxiliary contact and drives both VFDs' RUN/STOP
@@ -235,7 +235,7 @@ the write succeeds on the bus but the VFD ignores the value.
 | ESP32 DevKit V1 | MCU (Microcontroller Unit) — runs the firmware |
 | Micro-USB cable | Flash firmware from PC |
 | MAX485 module | Converts UART to RS-485 for VFD communication (shared bus, both VFDs) |
-| VFD1: LS Electric `LSLV0220S100-4EOFNS` | Cutter motor drive |
+| VFD1: LS Electric `LSLV0220S100-4EXNNS` (IP66) | Cutter motor drive |
 | VFD2: LS Electric `LSLV0004S100-4EOFNS` | Pump drive |
 | 3-phase induction motor(s) | Load |
 | MCR relay | Input signal source |

@@ -9,7 +9,7 @@
 #define STATUS_LED_PIN   2  // HIGH = cutter running, blinking = FAULT
 
 // --- Modbus RTU station addresses (set via each VFD's keypad, CM.01 "Int485 St ID") ---
-#define VFD1_ADDR 0x01  // Cutter (LSLV0220S100-4EOFNS)
+#define VFD1_ADDR 0x01  // Cutter (LSLV0220S100-4EXNNS)
 #define VFD2_ADDR 0x02  // Pump (LSLV0004S100-4EOFNS)
 
 // --- S100-series common-area registers (manual sec. 7.4, p.289) ---
