@@ -14,7 +14,7 @@
 
 // --- S100-series common-area registers (manual sec. 7.4, p.289) ---
 #define REG_OPERATION_COMMAND 0x0006  // bitfield; see CMD_* below for the writable low bits
-#define REG_COMMAND_FREQUENCY 0x0005  // 0.01 Hz units; not yet written by firmware
+#define REG_COMMAND_FREQUENCY 0x0005  // 0.01 Hz units; written by setCutterFrequency() in main.cpp
 
 #define CMD_STOP           0x0001  // B0
 #define CMD_RUN_FORWARD    0x0002  // B1
