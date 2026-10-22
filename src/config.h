@@ -9,12 +9,13 @@
 #define STATUS_LED_PIN   2  // HIGH = cutter running, blinking = FAULT
 
 // --- Modbus RTU station addresses (set via each VFD's keypad, CM.01 "Int485 St ID") ---
-#define VFD1_ADDR 0x01  // Cutter (LSLV0220S100-4EXNNS)
+#define VFD1_ADDR 0x01  // Cutter (LSLV0220S100-4EOFNS)
 #define VFD2_ADDR 0x02  // Pump (LSLV0004S100-4EOFNS)
 
 // --- S100-series common-area registers (manual sec. 7.4, p.289) ---
 #define REG_OPERATION_COMMAND 0x0006  // bitfield; see CMD_* below for the writable low bits
 #define REG_COMMAND_FREQUENCY 0x0005  // 0.01 Hz units; written by setCutterFrequency() in main.cpp
+#define REG_FAULT_TRIPINFO    0x000F  // nonzero = a fault is present on that VFD right now
 
 #define CMD_STOP           0x0001  // B0
 #define CMD_RUN_FORWARD    0x0002  // B1

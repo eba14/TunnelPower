@@ -20,7 +20,7 @@ void check(bool cond, const char *label) {
 
 int main() {
     uint8_t frame[FRAME_LEN];
-    buildModbusFrame(frame, VFD1_ADDR, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
+    buildModbusFrame(frame, VFD1_ADDR, MODBUS_FC_WRITE_SINGLE, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
 
     // Healthy VFD: succeeds on the first attempt, no retries burned.
     {
@@ -80,6 +80,35 @@ int main() {
         auto outcome = sendModbusCommand(t, frame, FRAME_LEN, MAX_RETRIES, RESPONSE_TIMEOUT_MS);
         check(outcome.result == ModbusResult::TIMEOUT, "glitch outlasting the budget reports TIMEOUT");
         check(outcome.attempts == MAX_RETRIES + 1, "glitch outlasting the budget burns all retries");
+    }
+
+    // readModbusRegister: healthy VFD returns the register's actual value.
+    {
+        FakeRs485Transport t;
+        t.mode = FakeMode::REPLY_READ_VALUE;
+        t.readReplyValue = 0x0000;
+        auto outcome = readModbusRegister(t, VFD1_ADDR, REG_FAULT_TRIPINFO, MAX_RETRIES, RESPONSE_TIMEOUT_MS);
+        check(outcome.result == ModbusResult::OK, "fault read succeeds against a healthy VFD");
+        check(outcome.value == 0x0000, "no-fault value (0x0000) read back correctly");
+    }
+
+    // readModbusRegister: a real fault code comes back intact.
+    {
+        FakeRs485Transport t;
+        t.mode = FakeMode::REPLY_READ_VALUE;
+        t.readReplyValue = 0x0007;
+        auto outcome = readModbusRegister(t, VFD2_ADDR, REG_FAULT_TRIPINFO, MAX_RETRIES, RESPONSE_TIMEOUT_MS);
+        check(outcome.result == ModbusResult::OK && outcome.value == 0x0007,
+              "nonzero fault code read back correctly");
+    }
+
+    // readModbusRegister: dead VFD still exhausts retries and reports TIMEOUT, same as writes.
+    {
+        FakeRs485Transport t;
+        t.mode = FakeMode::NEVER_RESPOND;
+        auto outcome = readModbusRegister(t, VFD1_ADDR, REG_FAULT_TRIPINFO, MAX_RETRIES, RESPONSE_TIMEOUT_MS);
+        check(outcome.result == ModbusResult::TIMEOUT, "dead VFD read reports TIMEOUT");
+        check(outcome.attempts == MAX_RETRIES + 1, "dead VFD read burns all retries");
     }
 
     std::printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED");

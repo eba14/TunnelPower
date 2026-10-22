@@ -1,7 +1,7 @@
 # TunnelPower (Washington Tunneling) — MCR/VFD Communication POC
 
 Proof of Concept (POC) for ESP32 ↔ LS Electric VFD (Variable Frequency Drive) communication over Modbus RTU (Remote Terminal Unit) via RS-485, controlling both drives on the panel:
-- **VFD1** (addr 1, `LSLV0220S100-4EXNNS`) — cutter motor
+- **VFD1** (addr 1, `LSLV0220S100-4EOFNS`) — cutter motor
 - **VFD2** (addr 2, `LSLV0004S100-4EOFNS`) — water pump
 
 The ESP32 reads an MCR (Motor Control Relay) auxiliary contact and drives both VFDs' RUN/STOP
@@ -19,11 +19,14 @@ bring-up/test input, not the final remote-operator interface.
 
 | File | Purpose |
 |---|---|
-| `src/main.cpp` | ESP32 firmware — RS-485 transport, Serial speed command, and the FSM |
+| `src/main.cpp` | ESP32 firmware — RS-485 transport, Serial speed command; wires `Fsm` to real hardware |
 | `src/config.h` | Pin assignments, Modbus addresses/registers, timing constants |
+| `src/fsm.h` | The state-transition logic itself — no Arduino dependency |
 | `src/modbus_protocol.h` | CRC16, frame building, response validation — no Arduino dependency |
 | `src/modbus_command.h` | Retry/timeout orchestration over an `Rs485Transport` — no Arduino dependency |
 | `src/rs485_transport.h` | `Rs485Transport` interface — real UART on ESP32, fake VFD in tests |
+| `test/test_fsm.cpp` | Native (PC) test of `Fsm` against a fake VFD pair — see Testing section |
+| `test/fake_fsm_actions.h` | Fake VFD pair used by `test_fsm.cpp` (configurable pump/cutter start success) |
 | `test/test_modbus_protocol.cpp` | Native (PC) test of the protocol logic — see Testing section |
 | `test/test_modbus_command.cpp` | Native (PC) test of retry/timeout logic against a fake VFD — see Testing section |
 | `test/fake_rs485_transport.h` | Fake VFD used by `test_modbus_command.cpp` (healthy / dead / noisy / rejecting / intermittent) |
@@ -77,6 +80,7 @@ command is considered failed):
 | PUMP_LEAD_WAIT | MCR drops | Abort: send VFD2 STOP → back to `IDLE`. |
 | PUMP_LEAD_WAIT | `PUMP_LEAD_MS` elapses (MCR still HIGH) | Send VFD1 (cutter) RUN + X1 HIGH. Confirmed → `RUNNING`. Failed after retries → stop VFD2, go to `FAULT`. |
 | RUNNING | MCR goes LOW | Send VFD1 STOP + X1 LOW (unconditional — doesn't wait on Modbus ack) → `CUTTER_SETTLE_WAIT`. |
+| RUNNING | Either VFD reports a fault (`REG_FAULT_TRIPINFO` nonzero) | Stop both VFDs → `FAULT`. Catches a fault occurring *during* operation, not just at start — the one window a simple command ACK can't see. |
 | CUTTER_SETTLE_WAIT | `CUTTER_STOP_SETTLE_MS` elapses | Send VFD2 (pump) STOP → `IDLE`. |
 | FAULT | — | Status LED blinks. Cleared only when MCR cycles back to LOW → `IDLE`. |
 
@@ -107,6 +111,14 @@ silently ship the way the original register addresses once did (see Testing sect
 | VFD1 (cutter) | 0x01 | Freq setpoint example (45.00 Hz) | 0x0005 | 0x1194 | `01 06 00 05 11 94 94 34` |
 | VFD2 (pump) | 0x02 | RUN (forward) | 0x0006 | 0x0002 | `02 06 00 06 00 02 E8 39` |
 | VFD2 (pump) | 0x02 | STOP | 0x0006 | 0x0001 | `02 06 00 06 00 01 A8 38` |
+| VFD1 (cutter) | 0x01 | Read fault status (FC 0x03) | 0x000F | — | `01 03 00 0F 00 01 B4 09` |
+| VFD2 (pump) | 0x02 | Read fault status (FC 0x03) | 0x000F | — | `02 03 00 0F 00 01 B4 3A` |
+
+The fault-status read (`0x000F`, "Fault trip information" — nonzero means a fault is present)
+is polled once per tick while `RUNNING`, catching a fault that occurs *during* operation, not
+just one that would block a RUN/STOP command's ACK at start. A failed read (timeout/mismatch)
+is treated as "no fault" rather than tripping the machine — a comm glitch on a status poll
+shouldn't itself cause a stop; only a confirmed nonzero fault code does.
 
 ---
 
@@ -172,36 +184,52 @@ RPM = (120 × Hz / poles) × 0.97
 
 ## Testing
 
-Two native (PC) test suites run against the actual source the ESP32 build compiles — not
+Three native (PC) test suites run against the actual source the ESP32 build compiles — not
 reimplementations. Requires a PC C++ compiler (e.g. MSYS2's `g++`, not PlatformIO's ESP32
 toolchain):
 ```
 g++ -std=c++17 -Wall -Wextra test/test_modbus_protocol.cpp -o test/test_modbus_protocol.exe
 g++ -std=c++17 -Wall -Wextra test/test_modbus_command.cpp -o test/test_modbus_command.exe
+g++ -std=c++17 -Wall -Wextra test/test_fsm.cpp -o test/test_fsm.exe
 ./test/test_modbus_protocol.exe
 ./test/test_modbus_command.exe
+./test/test_fsm.exe
 ```
 
 **`test_modbus_protocol.cpp`** — CRC correctness, exact-echo success, timeout, a corrupted
 echo, a well-formed Modbus exception reply, an exception reply with a bad CRC (must not be
-trusted), that RUN/STOP/frequency frames target the verified registers and values, and the
-frequency clamp (`clampInt`) at and past both bounds.
+trusted), that RUN/STOP/frequency/fault-read frames target the verified registers and values,
+correct value extraction from a read reply (including a wrong-byte-count reply being rejected
+rather than trusted), and the frequency clamp (`clampInt`) at and past both bounds.
 
 **`test_modbus_command.cpp`** — exercises the retry/timeout orchestration itself (not just
 frame validation) against `FakeRs485Transport`, a fake VFD configurable to behave like a
 healthy drive, a dead one, a noisy line (corrupted replies), a drive that explicitly rejects
-the register, or one with a transient glitch that clears partway through the retry budget.
-This is what caught a real behavioral bug while building it: the original retry loop retried
-on *every* failure including a Modbus exception — but an exception means the VFD understood
-the request and explicitly refused it (e.g. wrong register), so retrying the identical frame
-can't produce a different result. `sendModbusCommand()` now fails fast on `EXCEPTION` and
-only retries `TIMEOUT`/`MISMATCH`, the failure modes retrying can plausibly fix.
+the register, or one with a transient glitch that clears partway through the retry budget —
+covering both `sendModbusCommand()` (writes) and `readModbusRegister()` (reads, including a
+real fault-code value coming back intact). This is what caught a real behavioral bug while
+building it: the original retry loop retried on *every* failure including a Modbus exception
+— but an exception means the VFD understood the request and explicitly refused it (e.g. wrong
+register), so retrying the identical frame can't produce a different result. Both functions
+now fail fast on `EXCEPTION` and only retry `TIMEOUT`/`MISMATCH`, the failure modes retrying
+can plausibly fix.
+
+**`test_fsm.cpp`** — exercises every state transition in `Fsm` (`src/fsm.h`) against
+`FakeFsmActions`, a fake VFD pair whose pump/cutter start results (and fault status) are
+configurable. Covers the normal full start/stop cycle, aborting mid-sequence when MCR drops
+during the pump lead, `FAULT` entry on either VFD failing to start (confirming the pump gets
+stopped if the cutter fails, not left running for nothing), a fault detected mid-`RUNNING`
+(both VFDs stopped, not just one), `FAULT` only clearing on an MCR cycle, and that timing
+thresholds (`PUMP_LEAD_MS`, `CUTTER_STOP_SETTLE_MS`) are respected to the millisecond. Before
+this existed, the FSM — the core logic of the whole firmware — had only ever been manually
+traced and exercised once on real hardware by physically touching a pin; it had no automated
+regression coverage at all.
 
 What this does **not** test: real UART timing or actual RS-485 electrical behavior — the
 `Esp32Rs485Transport` class in `main.cpp` that talks to real hardware is itself untested by
-either harness. `simulate.py` also always takes the happy path (it fakes a perfect echo), so
-no tool here has exercised this logic against real serial hardware yet — only a real VFD can
-confirm that.
+any of these harnesses. `simulate.py` also always takes the happy path (it fakes a perfect
+echo), so no tool here has exercised this logic against real serial hardware yet — only a real
+VFD can confirm that.
 
 ---
 
@@ -235,7 +263,7 @@ the write succeeds on the bus but the VFD ignores the value.
 | ESP32 DevKit V1 | MCU (Microcontroller Unit) — runs the firmware |
 | Micro-USB cable | Flash firmware from PC |
 | MAX485 module | Converts UART to RS-485 for VFD communication (shared bus, both VFDs) |
-| VFD1: LS Electric `LSLV0220S100-4EXNNS` (IP66) | Cutter motor drive |
+| VFD1: LS Electric `LSLV0220S100-4EOFNS` (IP20) | Cutter motor drive |
 | VFD2: LS Electric `LSLV0004S100-4EOFNS` | Pump drive |
 | 3-phase induction motor(s) | Load |
 | MCR relay | Input signal source |

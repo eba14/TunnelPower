@@ -3,4 +3,5 @@
 *.txt
 *.exe
 *.log
+*.pdf
 __pycache__/

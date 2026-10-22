@@ -22,7 +22,7 @@ import math
 
 POLES = 4  # assumed 4-pole motor
 
-VFD1_ADDR = 0x01  # cutter motor VFD (LSLV0220S100-4EXNNS)
+VFD1_ADDR = 0x01  # cutter motor VFD (LSLV0220S100-4EOFNS)
 VFD2_ADDR = 0x02  # pump VFD (LSLV0004S100-4EOFNS)
 
 PUMP_LEAD_S          = 0.5  # matches PUMP_LEAD_MS in src/config.h

@@ -4,16 +4,16 @@
 // Every write is ACK-verified against the VFD's echoed response and retried on failure.
 // Cutter speed: send "F <hz>" over USB Serial (e.g. "F 45.5") -- a bring-up/test input,
 // not the final remote-operator interface.
+//
+// The state-transition logic itself lives in fsm.h (Arduino-independent, unit-tested in
+// test/test_fsm.cpp against a fake VFD). This file wires that logic to real hardware.
 
 #include <Arduino.h>
 #include "config.h"
 #include "modbus_protocol.h"
 #include "modbus_command.h"
 #include "rs485_transport.h"
-
-enum class State { IDLE, PUMP_LEAD_WAIT, RUNNING, CUTTER_SETTLE_WAIT, FAULT };
-State currentState = State::IDLE;
-unsigned long stateEnteredAt = 0;
+#include "fsm.h"
 
 HardwareSerial vfdSerial(2);  // UART2 for VFD bus; UART0 = USB debug Serial
 
@@ -75,28 +75,57 @@ ModbusResult sendVfdCommand(const uint8_t *frame, size_t len, const char *label)
     return outcome.result;
 }
 
-bool attemptPumpStart() {
-    return sendVfdCommand(vfd2RunFrame, FRAME_LEN, "VFD2 (pump) RUN") == ModbusResult::OK;
-}
-
-bool attemptCutterStart() {
-    bool ok = sendVfdCommand(vfd1RunFrame, FRAME_LEN, "VFD1 (cutter) RUN") == ModbusResult::OK;
-    if (ok) {
-        digitalWrite(VFD1_X1_PIN, HIGH);
-        digitalWrite(STATUS_LED_PIN, HIGH);
+// A failed read is treated as "no fault" rather than triggering FAULT itself -- a transient
+// comm glitch on a status poll shouldn't trip the machine; only a confirmed nonzero fault
+// code should.
+bool vfdHasFault(uint8_t addr, const char *label) {
+    ModbusReadOutcome outcome = readModbusRegister(vfdTransport, addr, REG_FAULT_TRIPINFO, MAX_RETRIES, RESPONSE_TIMEOUT_MS);
+    if (outcome.result != ModbusResult::OK) {
+        Serial.print("[Modbus] "); Serial.print(label); Serial.println(" fault check FAILED (treated as no fault)");
+        return false;
     }
-    return ok;
+    if (outcome.value != 0) {
+        Serial.print("[Modbus] "); Serial.print(label); Serial.print(" reports fault code 0x");
+        Serial.println(outcome.value, HEX);
+        return true;
+    }
+    return false;
 }
 
-void attemptCutterStop() {
-    digitalWrite(VFD1_X1_PIN, LOW);     // unconditional: doesn't wait on Modbus ack
-    digitalWrite(STATUS_LED_PIN, LOW);
-    sendVfdCommand(vfd1StopFrame, FRAME_LEN, "VFD1 (cutter) STOP");
-}
+// Concrete FsmActions: performs real Modbus commands and the hardware side effects (X1
+// backup pin, status LED) that go with them.
+class Esp32Actions : public FsmActions {
+public:
+    bool pumpStart() override {
+        return sendVfdCommand(vfd2RunFrame, FRAME_LEN, "VFD2 (pump) RUN") == ModbusResult::OK;
+    }
 
-void attemptPumpStop() {
-    sendVfdCommand(vfd2StopFrame, FRAME_LEN, "VFD2 (pump) STOP");
-}
+    bool cutterStart() override {
+        bool ok = sendVfdCommand(vfd1RunFrame, FRAME_LEN, "VFD1 (cutter) RUN") == ModbusResult::OK;
+        if (ok) {
+            digitalWrite(VFD1_X1_PIN, HIGH);
+            digitalWrite(STATUS_LED_PIN, HIGH);
+        }
+        return ok;
+    }
+
+    void cutterStop() override {
+        digitalWrite(VFD1_X1_PIN, LOW);     // unconditional: doesn't wait on Modbus ack
+        digitalWrite(STATUS_LED_PIN, LOW);
+        sendVfdCommand(vfd1StopFrame, FRAME_LEN, "VFD1 (cutter) STOP");
+    }
+
+    void pumpStop() override {
+        sendVfdCommand(vfd2StopFrame, FRAME_LEN, "VFD2 (pump) STOP");
+    }
+
+    bool anyFault() override {
+        return vfdHasFault(VFD1_ADDR, "VFD1 (cutter)") || vfdHasFault(VFD2_ADDR, "VFD2 (pump)");
+    }
+};
+
+Esp32Actions esp32Actions;
+Fsm fsm;
 
 // Writes VFD1's frequency setpoint. Can be called whether the cutter is running or not --
 // the VFD applies it once running. Clamped here (not just at the Serial parser) so no
@@ -105,15 +134,12 @@ bool setCutterFrequency(int centiHz) {
     centiHz = clampInt(centiHz, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ);
 
     uint8_t frame[FRAME_LEN];
-    buildModbusFrame(frame, VFD1_ADDR, REG_COMMAND_FREQUENCY, (uint16_t)centiHz);
+    buildModbusFrame(frame, VFD1_ADDR, MODBUS_FC_WRITE_SINGLE, REG_COMMAND_FREQUENCY, (uint16_t)centiHz);
     return sendVfdCommand(frame, FRAME_LEN, "VFD1 (cutter) frequency setpoint") == ModbusResult::OK;
 }
 
 // Bring-up input: "F <hz>" over USB Serial, e.g. "F 45.5". Not the final remote interface.
-void handleSerialCommand() {
-    if (!Serial.available()) return;
-
-    String line = Serial.readStringUntil('\n');
+void processSerialLine(String line) {
     line.trim();
     if (line.length() == 0) return;
 
@@ -134,9 +160,33 @@ void handleSerialCommand() {
     }
 }
 
-void enterState(State s) {
-    currentState = s;
-    stateEnteredAt = millis();
+// Accumulates bytes across loop() calls and dispatches each complete line. Deliberately not
+// Serial.readStringUntil(): that blocks (up to Serial's timeout, 1000ms by default) waiting for
+// a newline, which would stall MCR polling and VFD sequencing if one never arrives -- exactly
+// the kind of blocking call the rest of this firmware was written to avoid.
+void handleSerialCommand() {
+    static String lineBuffer;
+
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') {
+            processSerialLine(lineBuffer);
+            lineBuffer = "";
+        } else if (c != '\r') {
+            lineBuffer += c;
+        }
+    }
+}
+
+const char *stateName(State s) {
+    switch (s) {
+        case State::IDLE:               return "IDLE";
+        case State::PUMP_LEAD_WAIT:     return "PUMP_LEAD_WAIT";
+        case State::RUNNING:            return "RUNNING";
+        case State::CUTTER_SETTLE_WAIT: return "CUTTER_SETTLE_WAIT";
+        case State::FAULT:              return "FAULT";
+        default:                        return "?";
+    }
 }
 
 void setup() {
@@ -152,10 +202,10 @@ void setup() {
     digitalWrite(VFD1_X1_PIN,    LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    buildModbusFrame(vfd1RunFrame,  VFD1_ADDR, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
-    buildModbusFrame(vfd1StopFrame, VFD1_ADDR, REG_OPERATION_COMMAND, CMD_STOP);
-    buildModbusFrame(vfd2RunFrame,  VFD2_ADDR, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
-    buildModbusFrame(vfd2StopFrame, VFD2_ADDR, REG_OPERATION_COMMAND, CMD_STOP);
+    buildModbusFrame(vfd1RunFrame,  VFD1_ADDR, MODBUS_FC_WRITE_SINGLE, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
+    buildModbusFrame(vfd1StopFrame, VFD1_ADDR, MODBUS_FC_WRITE_SINGLE, REG_OPERATION_COMMAND, CMD_STOP);
+    buildModbusFrame(vfd2RunFrame,  VFD2_ADDR, MODBUS_FC_WRITE_SINGLE, REG_OPERATION_COMMAND, CMD_RUN_FORWARD);
+    buildModbusFrame(vfd2StopFrame, VFD2_ADDR, MODBUS_FC_WRITE_SINGLE, REG_OPERATION_COMMAND, CMD_STOP);
 
     Serial.println("[BOOT] POC ready - waiting for MCR signal");
 }
@@ -165,58 +215,22 @@ void loop() {
 
     bool mcrActive = digitalRead(MCR_INPUT_PIN) == HIGH;
 
-    switch (currentState) {
-        case State::IDLE:
-            if (mcrActive) {
-                if (attemptPumpStart()) {
-                    enterState(State::PUMP_LEAD_WAIT);
-                } else {
-                    Serial.println("[FSM] -> FAULT: pump failed to start");
-                    enterState(State::FAULT);
-                }
-            }
-            break;
+    State before = fsm.state();
+    fsm.tick(mcrActive, millis(), esp32Actions);
+    State after = fsm.state();
 
-        case State::PUMP_LEAD_WAIT:
-            if (!mcrActive) {
-                Serial.println("[FSM] MCR dropped during pump lead - aborting start");
-                attemptPumpStop();
-                enterState(State::IDLE);
-            } else if (millis() - stateEnteredAt >= PUMP_LEAD_MS) {
-                if (attemptCutterStart()) {
-                    Serial.println("[FSM] -> RUNNING");
-                    enterState(State::RUNNING);
-                } else {
-                    Serial.println("[FSM] -> FAULT: cutter failed to start; stopping pump");
-                    attemptPumpStop();
-                    enterState(State::FAULT);
-                }
-            }
-            break;
+    if (before != after) {
+        Serial.print("[FSM] "); Serial.print(stateName(before));
+        Serial.print(" -> "); Serial.println(stateName(after));
+    }
 
-        case State::RUNNING:
-            if (!mcrActive) {
-                attemptCutterStop();
-                enterState(State::CUTTER_SETTLE_WAIT);
-            }
-            break;
-
-        case State::CUTTER_SETTLE_WAIT:
-            if (millis() - stateEnteredAt >= CUTTER_STOP_SETTLE_MS) {
-                attemptPumpStop();
-                Serial.println("[FSM] -> IDLE");
-                enterState(State::IDLE);
-            }
-            break;
-
-        case State::FAULT:
-            digitalWrite(STATUS_LED_PIN, ((millis() / 250) % 2) ? HIGH : LOW);
-            if (!mcrActive) {
-                digitalWrite(STATUS_LED_PIN, LOW);
-                Serial.println("[FSM] FAULT cleared (MCR cycled) -> IDLE");
-                enterState(State::IDLE);
-            }
-            break;
+    // FAULT indicator: blinks while in FAULT. Status LED during RUNNING is driven by
+    // Esp32Actions::cutterStart()/cutterStop() instead; explicitly clear it on the way
+    // out of FAULT since no cutter action runs on that transition to do it for us.
+    if (after == State::FAULT) {
+        digitalWrite(STATUS_LED_PIN, ((millis() / 250) % 2) ? HIGH : LOW);
+    } else if (before == State::FAULT) {
+        digitalWrite(STATUS_LED_PIN, LOW);
     }
 
     delay(100);

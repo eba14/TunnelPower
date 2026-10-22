@@ -5,7 +5,7 @@
 #include <cstring>
 #include <algorithm>
 
-enum class FakeMode { ALWAYS_ECHO, NEVER_RESPOND, ALWAYS_CORRUPT, ALWAYS_EXCEPTION, ECHO_AFTER_N_FAILURES };
+enum class FakeMode { ALWAYS_ECHO, NEVER_RESPOND, ALWAYS_CORRUPT, ALWAYS_EXCEPTION, ECHO_AFTER_N_FAILURES, REPLY_READ_VALUE };
 
 // A fake VFD for testing sendModbusCommand's retry logic without real hardware. transmit()
 // just records the frame; receive() replies according to `mode`, simulating a healthy VFD,
@@ -14,6 +14,7 @@ class FakeRs485Transport : public Rs485Transport {
 public:
     FakeMode mode = FakeMode::ALWAYS_ECHO;
     uint8_t failuresBeforeSuccess = 0;  // ECHO_AFTER_N_FAILURES only
+    uint16_t readReplyValue = 0;        // REPLY_READ_VALUE only -- the register value to return
     int transmitCount = 0;
 
     void transmit(const uint8_t *frame, size_t len) override {
@@ -28,6 +29,17 @@ public:
         if (mode == FakeMode::ALWAYS_CORRUPT) {
             size_t n = echoLastFrame(buf, bufLen);
             if (n > 0) buf[0] ^= 0xFF;
+            return n;
+        }
+
+        if (mode == FakeMode::REPLY_READ_VALUE) {
+            uint8_t reply[7] = {lastFrame[0], MODBUS_FC_READ_HOLDING, 0x02,
+                                 uint8_t(readReplyValue >> 8), uint8_t(readReplyValue & 0xFF), 0, 0};
+            uint16_t crc = modbusCRC16(reply, 5);
+            reply[5] = crc & 0xFF;
+            reply[6] = crc >> 8;
+            size_t n = std::min(sizeof(reply), bufLen);
+            std::memcpy(buf, reply, n);
             return n;
         }
 

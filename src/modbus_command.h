@@ -28,3 +28,33 @@ inline ModbusCommandOutcome sendModbusCommand(Rs485Transport &transport, const u
 
     return ModbusCommandOutcome{result, attemptsUsed};
 }
+
+struct ModbusReadOutcome {
+    ModbusResult result;
+    uint16_t value;
+    uint8_t attempts;
+};
+
+// Reads a single holding register, same retry/fail-fast rules as sendModbusCommand.
+inline ModbusReadOutcome readModbusRegister(Rs485Transport &transport, uint8_t addr, uint16_t reg,
+                                             uint8_t maxRetries, unsigned long responseTimeoutMs) {
+    uint8_t frame[8];
+    buildModbusFrame(frame, addr, MODBUS_FC_READ_HOLDING, reg, 1);
+
+    ModbusResult result = ModbusResult::TIMEOUT;
+    uint16_t value = 0;
+    uint8_t attemptsUsed = 0;
+
+    for (uint8_t attempt = 1; attempt <= maxRetries + 1; attempt++) {
+        attemptsUsed = attempt;
+        transport.transmit(frame, sizeof(frame));
+
+        uint8_t resp[16];
+        size_t n = transport.receive(resp, sizeof(resp), responseTimeoutMs);
+        result = evaluateReadResponse(addr, resp, n, &value);
+
+        if (result == ModbusResult::OK || result == ModbusResult::EXCEPTION) break;
+    }
+
+    return ModbusReadOutcome{result, value, attemptsUsed};
+}
