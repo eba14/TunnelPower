@@ -2,8 +2,8 @@
 // VFD2 (pump) over Modbus RTU/RS-485, with an X1 hardwire backup for VFD1.
 // Start: pump RUN -> wait PUMP_LEAD_MS -> cutter RUN. Stop: cutter STOP -> wait -> pump STOP.
 // Every write is ACK-verified against the VFD's echoed response and retried on failure.
-// Cutter speed: send "F <hz>" over USB Serial (e.g. "F 45.5") -- a bring-up/test input,
-// not the final remote-operator interface.
+// Speed control: send "FC <hz>" (cutter) or "FP <hz>" (pump) over USB Serial, e.g. "FC 45.5"
+// -- a bring-up/test input, not the final remote-operator interface.
 //
 // The state-transition logic itself lives in fsm.h (Arduino-independent, unit-tested in
 // test/test_fsm.cpp against a fake VFD). This file wires that logic to real hardware.
@@ -127,34 +127,53 @@ public:
 Esp32Actions esp32Actions;
 Fsm fsm;
 
-// Writes VFD1's frequency setpoint. Can be called whether the cutter is running or not --
-// the VFD applies it once running. Clamped here (not just at the Serial parser) so no
-// caller can push an out-of-range value onto the register.
-bool setCutterFrequency(int centiHz) {
-    centiHz = clampInt(centiHz, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ);
+// Writes a VFD's frequency setpoint. Can be called whether that VFD is running or not --
+// it applies once running. Clamped here (not just at the Serial parser) so no caller can
+// push an out-of-range value onto the register.
+bool setFrequency(uint8_t vfdAddr, int centiHz, int minCentiHz, int maxCentiHz, const char *label) {
+    centiHz = clampInt(centiHz, minCentiHz, maxCentiHz);
 
     uint8_t frame[FRAME_LEN];
-    buildModbusFrame(frame, VFD1_ADDR, MODBUS_FC_WRITE_SINGLE, REG_COMMAND_FREQUENCY, (uint16_t)centiHz);
-    return sendVfdCommand(frame, FRAME_LEN, "VFD1 (cutter) frequency setpoint") == ModbusResult::OK;
+    buildModbusFrame(frame, vfdAddr, MODBUS_FC_WRITE_SINGLE, REG_COMMAND_FREQUENCY, (uint16_t)centiHz);
+    return sendVfdCommand(frame, FRAME_LEN, label) == ModbusResult::OK;
 }
 
-// Bring-up input: "F <hz>" over USB Serial, e.g. "F 45.5". Not the final remote interface.
+bool setCutterFrequency(int centiHz) {
+    return setFrequency(VFD1_ADDR, centiHz, CUTTER_MIN_CENTIHERTZ, CUTTER_MAX_CENTIHERTZ, "VFD1 (cutter) frequency setpoint");
+}
+
+bool setPumpFrequency(int centiHz) {
+    return setFrequency(VFD2_ADDR, centiHz, PUMP_MIN_CENTIHERTZ, PUMP_MAX_CENTIHERTZ, "VFD2 (pump) frequency setpoint");
+}
+
+// Shared by both Serial frequency commands below: parses "<number>" from after the prefix,
+// clamps/sends via setFn, and reports the result -- the only difference between FC/FP is
+// which VFD's setter and bounds get used.
+void handleFrequencyCommand(const String &arg, bool (*setFn)(int), const char *label) {
+    float hz = arg.toFloat();
+    if (hz < 0.0f || hz > 60.0f) {
+        Serial.print("[CMD] "); Serial.print(label); Serial.println(" frequency must be 0-60 Hz");
+        return;
+    }
+    int centiHz = (int)(hz * 100.0f + 0.5f);
+    if (setFn(centiHz)) {
+        Serial.print("[CMD] "); Serial.print(label); Serial.print(" frequency set to "); Serial.print(hz); Serial.println(" Hz");
+    } else {
+        Serial.print("[CMD] "); Serial.print(label); Serial.println(" frequency setpoint FAILED");
+    }
+}
+
+// Bring-up input over USB Serial: "FC <hz>" for the cutter, "FP <hz>" for the pump
+// (e.g. "FC 45.5"). Not the final remote interface.
 void processSerialLine(String line) {
     line.trim();
     if (line.length() == 0) return;
+    line.toUpperCase();
 
-    if (line.startsWith("F ") || line.startsWith("f ")) {
-        float hz = line.substring(2).toFloat();
-        if (hz < 0.0f || hz > 60.0f) {
-            Serial.println("[CMD] Frequency must be 0-60 Hz");
-            return;
-        }
-        int centiHz = (int)(hz * 100.0f + 0.5f);
-        if (setCutterFrequency(centiHz)) {
-            Serial.print("[CMD] VFD1 frequency set to "); Serial.print(hz); Serial.println(" Hz");
-        } else {
-            Serial.println("[CMD] Frequency setpoint FAILED");
-        }
+    if (line.startsWith("FC ")) {
+        handleFrequencyCommand(line.substring(3), setCutterFrequency, "Cutter");
+    } else if (line.startsWith("FP ")) {
+        handleFrequencyCommand(line.substring(3), setPumpFrequency, "Pump");
     } else {
         Serial.print("[CMD] Unknown command: "); Serial.println(line);
     }

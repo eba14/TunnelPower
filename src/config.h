@@ -14,7 +14,7 @@
 
 // --- S100-series common-area registers (manual sec. 7.4, p.289) ---
 #define REG_OPERATION_COMMAND 0x0006  // bitfield; see CMD_* below for the writable low bits
-#define REG_COMMAND_FREQUENCY 0x0005  // 0.01 Hz units; written by setCutterFrequency() in main.cpp
+#define REG_COMMAND_FREQUENCY 0x0005  // 0.01 Hz units; written by setCutterFrequency()/setPumpFrequency()
 #define REG_FAULT_TRIPINFO    0x000F  // nonzero = a fault is present on that VFD right now
 
 #define CMD_STOP           0x0001  // B0
@@ -25,11 +25,15 @@
 // B5-B14 report command/frequency source (keypad/terminal/485) and are read-only on this
 // register -- source is set once via keypad, not re-written per command.
 
-// Cutter (VFD1) frequency setpoint bounds, in 0.01 Hz units (register 0x0005 scale).
-// Requires VFD1's "Frq" (Frequency reference source, Operation group) keypad parameter
-// set to 6 (Int 485) -- otherwise the VFD ignores this register regardless of what's written.
-#define VFD1_MIN_CENTIHERTZ 0     // 0.00 Hz
-#define VFD1_MAX_CENTIHERTZ 6000  // 60.00 Hz
+// Frequency setpoint bounds, in 0.01 Hz units (register 0x0005 scale), one pair per VFD.
+// Each requires that VFD's "Frq" (Frequency reference source, Operation group) keypad
+// parameter set to 6 (Int 485) -- otherwise it ignores this register regardless of what's
+// written. Pump frequency control is here in case the fluids team ends up keeping a VFD
+// for the pump instead of a fixed-speed relay + valve.
+#define CUTTER_MIN_CENTIHERTZ 0     // 0.00 Hz
+#define CUTTER_MAX_CENTIHERTZ 6000  // 60.00 Hz
+#define PUMP_MIN_CENTIHERTZ   0     // 0.00 Hz
+#define PUMP_MAX_CENTIHERTZ   6000  // 60.00 Hz
 
 #define FRAME_LEN 8  // 6 data bytes + 2 CRC bytes
 

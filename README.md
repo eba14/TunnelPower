@@ -10,8 +10,10 @@ commanded RUN first, then the cutter (VFD1) after a short lead delay — matchin
 the panel's hardware interlock where VFD2's relay output feeds VFD1's program/start-permit pin.
 On stop, the cutter is commanded STOP first (removing the load) and the pump second.
 
-Cutter speed is set by sending `F <hz>` over USB Serial (e.g. `F 45.5`) at any time — a
-bring-up/test input, not the final remote-operator interface.
+Speed is set over USB Serial at any time — `FC <hz>` for the cutter, `FP <hz>` for the pump
+(e.g. `FC 45.5`) — a bring-up/test input, not the final remote-operator interface. Pump speed
+control exists in case the fluids team ends up keeping a VFD for the pump instead of a
+fixed-speed relay + controllable valve.
 
 ---
 
@@ -96,9 +98,10 @@ at all), since confirming a command actually landed is worth a short bounded sta
 Register addresses are from the official LS Electric S100 manual, section 7.4 "Compatible
 Common Area Parameter" (p.289) — not assumed. `0x0006` ("Operation command") is a bitfield;
 only the low bits matter for RUN/STOP (B0=Stop, B1=Forward run). `0x0005` ("Command
-frequency", 0.01 Hz units) is written by `setCutterFrequency()` in `main.cpp` in response to
-the `F <hz>` Serial command, clamped to `VFD1_MIN_CENTIHERTZ`/`VFD1_MAX_CENTIHERTZ`
-(0–60 Hz) regardless of what the caller passes in.
+frequency", 0.01 Hz units) is written by `setCutterFrequency()`/`setPumpFrequency()` in
+`main.cpp`, in response to the `FC`/`FP` Serial commands respectively, each clamped to its own
+bounds (`CUTTER_MIN/MAX_CENTIHERTZ`, `PUMP_MIN/MAX_CENTIHERTZ` — both currently 0–60 Hz)
+regardless of what the caller passes in.
 
 Frames are built at runtime from `buildModbusFrame()`/`modbusCRC16()` in `modbus_protocol.h`
 (and the equivalent in `simulate.py`) rather than hand-typed, so a transcription error can't
@@ -130,7 +133,7 @@ Parameters" p.275 — not the generic placeholder codes an earlier revision of t
 | Group.Code | LCD Display | VFD1 (cutter) | VFD2 (pump) | Description |
 |---|---|---|---|---|
 | DRV-06 | Cmd Source | 3 (Int 485) | 3 (Int 485) | **Required** — without this the VFD ignores Modbus RUN/STOP entirely and listens to the keypad/terminal instead. Not the factory default. |
-| Frq (Operation group) | Freq Ref Src | 6 (Int 485) | — | **Required on VFD1** for `F <hz>` to have any effect — without it the VFD ignores the frequency register and keeps using its keypad/analog setpoint. Not the factory default. VFD2 doesn't need this (fixed-speed pump, no setpoint written). |
+| Frq (Operation group) | Freq Ref Src | 6 (Int 485) | 6 (Int 485) | **Required on both** for `FC`/`FP` to have any effect — without it a VFD ignores the frequency register and keeps using its keypad/analog setpoint. Not the factory default. If the fluids team drops the pump VFD in favor of a fixed-speed relay + valve, VFD2's row here becomes moot. |
 | CM.01 | Int485 St ID | 1 | 2 | Station address — must match `VFD1_ADDR`/`VFD2_ADDR` in `config.h` |
 | CM.02 | Int485 Proto | 0 (Modbus RTU) | 0 (Modbus RTU) | Factory default already matches |
 | CM.03 | Int485 BaudR | 3 (9600 bps) | 3 (9600 bps) | Must match `vfdSerial.begin(9600, ...)` |
@@ -247,12 +250,14 @@ Expected boot output:
 [BOOT] POC ready — waiting for MCR signal
 ```
 
-To set cutter speed, type into the Serial Monitor's send line (Enter-terminated) at any time:
+To set speed, type into the Serial Monitor's send line (Enter-terminated) at any time:
 ```
-F 45.5
+FC 45.5
+FP 30.0
 ```
-Requires VFD1's `Frq` keypad parameter set to `6` (Int 485) — see VFD Parameters above — or
-the write succeeds on the bus but the VFD ignores the value.
+`FC` targets the cutter (VFD1), `FP` targets the pump (VFD2). Each requires that VFD's `Frq`
+keypad parameter set to `6` (Int 485) — see VFD Parameters above — or the write succeeds on
+the bus but the VFD ignores the value.
 
 ---
 

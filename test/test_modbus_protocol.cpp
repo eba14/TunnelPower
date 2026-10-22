@@ -106,14 +106,28 @@ int main() {
           "read reply with wrong byte count is MISMATCH");
 
     // setCutterFrequency's clamp (src/main.cpp) delegates to this -- verify the bounds directly.
-    check(clampInt(-100, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == VFD1_MIN_CENTIHERTZ,
-          "negative Hz clamps to VFD1_MIN_CENTIHERTZ (0)");
-    check(clampInt(9999, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == VFD1_MAX_CENTIHERTZ,
-          "over-range Hz clamps to VFD1_MAX_CENTIHERTZ (6000 = 60.00 Hz)");
-    check(clampInt(4500, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == 4500,
+    check(clampInt(-100, CUTTER_MIN_CENTIHERTZ, CUTTER_MAX_CENTIHERTZ) == CUTTER_MIN_CENTIHERTZ,
+          "negative Hz clamps to CUTTER_MIN_CENTIHERTZ (0)");
+    check(clampInt(9999, CUTTER_MIN_CENTIHERTZ, CUTTER_MAX_CENTIHERTZ) == CUTTER_MAX_CENTIHERTZ,
+          "over-range Hz clamps to CUTTER_MAX_CENTIHERTZ (6000 = 60.00 Hz)");
+    check(clampInt(4500, CUTTER_MIN_CENTIHERTZ, CUTTER_MAX_CENTIHERTZ) == 4500,
           "in-range Hz passes through unclamped");
-    check(clampInt(VFD1_MAX_CENTIHERTZ, VFD1_MIN_CENTIHERTZ, VFD1_MAX_CENTIHERTZ) == VFD1_MAX_CENTIHERTZ,
+    check(clampInt(CUTTER_MAX_CENTIHERTZ, CUTTER_MIN_CENTIHERTZ, CUTTER_MAX_CENTIHERTZ) == CUTTER_MAX_CENTIHERTZ,
           "exact upper bound (60.00 Hz) passes through unclamped");
+
+    // setPumpFrequency's clamp uses the same pattern against its own bounds constants.
+    check(clampInt(-50, PUMP_MIN_CENTIHERTZ, PUMP_MAX_CENTIHERTZ) == PUMP_MIN_CENTIHERTZ,
+          "negative Hz clamps to PUMP_MIN_CENTIHERTZ (0)");
+    check(clampInt(7000, PUMP_MIN_CENTIHERTZ, PUMP_MAX_CENTIHERTZ) == PUMP_MAX_CENTIHERTZ,
+          "over-range Hz clamps to PUMP_MAX_CENTIHERTZ (6000 = 60.00 Hz)");
+
+    // Pump frequency frame: same register as cutter, but targets VFD2's address -- confirms
+    // the two frequency paths are wired to the correct, distinct VFDs.
+    uint8_t pumpFreq30[8];
+    buildModbusFrame(pumpFreq30, VFD2_ADDR, MODBUS_FC_WRITE_SINGLE, REG_COMMAND_FREQUENCY, 3000);
+    check(pumpFreq30[0] == VFD2_ADDR, "pump frequency frame addresses VFD2, not VFD1");
+    check(pumpFreq30[2] == 0x00 && pumpFreq30[3] == 0x05, "pump frequency frame targets register 0x0005");
+    check(pumpFreq30[4] == 0x0B && pumpFreq30[5] == 0xB8, "30.00 Hz encodes as 0x0BB8 (3000 x 0.01Hz)");
 
     std::printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED");
     return failures == 0 ? 0 : 1;
