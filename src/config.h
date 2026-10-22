@@ -40,4 +40,4 @@
 // --- Modbus transaction timing (tune once real VFDs are on the bench) ---
 #define RESPONSE_TIMEOUT_MS   50
 #define INTERBYTE_SILENCE_MS   4  // ~3.5 char times at 9600 baud = end of reply frame
-#define MAX_RETRIES             2
+#define MAX_RETRIES            2
