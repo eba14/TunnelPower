@@ -86,26 +86,21 @@ command is considered failed):
 | CUTTER_SETTLE_WAIT | `CUTTER_STOP_SETTLE_MS` elapses | Send VFD2 (pump) STOP → `IDLE`. |
 | FAULT | — | Status LED blinks. Cleared only when MCR cycles back to LOW → `IDLE`. |
 
-Because the waits are non-blocking, a dropped MCR signal is noticed on the next 100ms poll
-even mid-sequence — not after a fixed delay elapses. Individual Modbus transactions remain
-short, bounded blocking calls (typically a few ms; worst case ~150ms if a VFD doesn't respond
-at all), since confirming a command actually landed is worth a short bounded stall.
+Waits are non-blocking (`millis()`, not `delay()`), so a dropped MCR is noticed within 100ms
+even mid-sequence. Each Modbus transaction is still a short, bounded blocking call (a few ms;
+~150ms worst case) — confirming a command landed is worth a brief stall.
 
 ---
 
 ## Modbus Frames
 
 Register addresses are from the official LS Electric S100 manual, section 7.4 "Compatible
-Common Area Parameter" (p.289) — not assumed. `0x0006` ("Operation command") is a bitfield;
-only the low bits matter for RUN/STOP (B0=Stop, B1=Forward run). `0x0005` ("Command
-frequency", 0.01 Hz units) is written by `setCutterFrequency()`/`setPumpFrequency()` in
-`main.cpp`, in response to the `FC`/`FP` Serial commands respectively, each clamped to its own
-bounds (`CUTTER_MIN/MAX_CENTIHERTZ`, `PUMP_MIN/MAX_CENTIHERTZ` — both currently 0–60 Hz)
-regardless of what the caller passes in.
+Common Area Parameter" (p.289) — not assumed. `0x0006` is a bitfield (only B0=Stop, B1=Forward
+run matter here). `0x0005` (frequency, 0.01 Hz units) is written by `setCutterFrequency()`/
+`setPumpFrequency()`, each clamped to its own bounds regardless of caller input.
 
-Frames are built at runtime from `buildModbusFrame()`/`modbusCRC16()` in `modbus_protocol.h`
-(and the equivalent in `simulate.py`) rather than hand-typed, so a transcription error can't
-silently ship the way the original register addresses once did (see Testing section below).
+Frames are built at runtime (`buildModbusFrame()`/`modbusCRC16()`), never hand-typed — a
+transcription error can't silently ship the way the original register addresses once did.
 
 | VFD | Addr | Command | Register | Value | Frame |
 |---|---|---|---|---|---|
@@ -117,18 +112,16 @@ silently ship the way the original register addresses once did (see Testing sect
 | VFD1 (cutter) | 0x01 | Read fault status (FC 0x03) | 0x000F | — | `01 03 00 0F 00 01 B4 09` |
 | VFD2 (pump) | 0x02 | Read fault status (FC 0x03) | 0x000F | — | `02 03 00 0F 00 01 B4 3A` |
 
-The fault-status read (`0x000F`, "Fault trip information" — nonzero means a fault is present)
-is polled once per tick while `RUNNING`, catching a fault that occurs *during* operation, not
-just one that would block a RUN/STOP command's ACK at start. A failed read (timeout/mismatch)
-is treated as "no fault" rather than tripping the machine — a comm glitch on a status poll
-shouldn't itself cause a stop; only a confirmed nonzero fault code does.
+The fault-status read (`0x000F`, nonzero = fault present) is polled once per tick while
+`RUNNING`, catching a fault mid-operation that a RUN/STOP command's ACK alone wouldn't see. A
+failed read is treated as "no fault," not a trip — a comm glitch on a status poll shouldn't
+itself stop the machine.
 
 ---
 
 ## VFD Parameters
-Set these on each VFD's keypad before testing (codes verified against the S100 manual,
-sections 4.5 "Command Source Configuration" p.117 and 7.2 "Setting Communication
-Parameters" p.275 — not the generic placeholder codes an earlier revision of this doc used):
+Set on each VFD's keypad before testing (codes verified against the S100 manual, sections 4.5
+and 7.2):
 
 | Group.Code | LCD Display | VFD1 (cutter) | VFD2 (pump) | Description |
 |---|---|---|---|---|
@@ -199,40 +192,24 @@ g++ -std=c++17 -Wall -Wextra test/test_fsm.cpp -o test/test_fsm.exe
 ./test/test_fsm.exe
 ```
 
-**`test_modbus_protocol.cpp`** — CRC correctness, exact-echo success, timeout, a corrupted
-echo, a well-formed Modbus exception reply, an exception reply with a bad CRC (must not be
-trusted), that RUN/STOP/frequency/fault-read frames target the verified registers and values,
-correct value extraction from a read reply (including a wrong-byte-count reply being rejected
-rather than trusted), and the frequency clamp (`clampInt`) at and past both bounds.
+**`test_modbus_protocol.cpp`** — CRC correctness, response validation (echo, timeout,
+corruption, exceptions — with and without a bad CRC), frame contents for RUN/STOP/frequency/
+fault-read, and the frequency clamp at both bounds.
 
-**`test_modbus_command.cpp`** — exercises the retry/timeout orchestration itself (not just
-frame validation) against `FakeRs485Transport`, a fake VFD configurable to behave like a
-healthy drive, a dead one, a noisy line (corrupted replies), a drive that explicitly rejects
-the register, or one with a transient glitch that clears partway through the retry budget —
-covering both `sendModbusCommand()` (writes) and `readModbusRegister()` (reads, including a
-real fault-code value coming back intact). This is what caught a real behavioral bug while
-building it: the original retry loop retried on *every* failure including a Modbus exception
-— but an exception means the VFD understood the request and explicitly refused it (e.g. wrong
-register), so retrying the identical frame can't produce a different result. Both functions
-now fail fast on `EXCEPTION` and only retry `TIMEOUT`/`MISMATCH`, the failure modes retrying
-can plausibly fix.
+**`test_modbus_command.cpp`** — retry/timeout orchestration against `FakeRs485Transport`
+(healthy / dead / noisy / rejecting / intermittent), covering both writes and reads. Caught a
+real bug: the retry loop used to retry on Modbus exceptions too, which can't ever succeed on
+retry (the VFD already explicitly rejected the frame) — now fails fast on `EXCEPTION`, only
+retries `TIMEOUT`/`MISMATCH`.
 
-**`test_fsm.cpp`** — exercises every state transition in `Fsm` (`src/fsm.h`) against
-`FakeFsmActions`, a fake VFD pair whose pump/cutter start results (and fault status) are
-configurable. Covers the normal full start/stop cycle, aborting mid-sequence when MCR drops
-during the pump lead, `FAULT` entry on either VFD failing to start (confirming the pump gets
-stopped if the cutter fails, not left running for nothing), a fault detected mid-`RUNNING`
-(both VFDs stopped, not just one), `FAULT` only clearing on an MCR cycle, and that timing
-thresholds (`PUMP_LEAD_MS`, `CUTTER_STOP_SETTLE_MS`) are respected to the millisecond. Before
-this existed, the FSM — the core logic of the whole firmware — had only ever been manually
-traced and exercised once on real hardware by physically touching a pin; it had no automated
-regression coverage at all.
+**`test_fsm.cpp`** — every `Fsm` state transition against `FakeFsmActions`: full start/stop
+cycle, mid-sequence abort, `FAULT` entry on either VFD failing to start, a fault detected
+mid-`RUNNING`, `FAULT` clearing only on an MCR cycle, and exact timing thresholds. Previously
+the FSM had zero automated coverage — only a manual trace and one physical-pin-touch test.
 
-What this does **not** test: real UART timing or actual RS-485 electrical behavior — the
-`Esp32Rs485Transport` class in `main.cpp` that talks to real hardware is itself untested by
-any of these harnesses. `simulate.py` also always takes the happy path (it fakes a perfect
-echo), so no tool here has exercised this logic against real serial hardware yet — only a real
-VFD can confirm that.
+**Not tested by any of this:** real UART timing or RS-485 electrical behavior —
+`Esp32Rs485Transport` is untested by these harnesses, and `simulate.py` always takes the
+happy path. Only a real VFD can confirm those.
 
 ---
 
@@ -265,11 +242,14 @@ the bus but the VFD ignores the value.
 
 | Component | Purpose |
 |---|---|
-| ESP32 DevKit V1 | MCU (Microcontroller Unit) — runs the firmware |
-| Micro-USB cable | Flash firmware from PC |
-| MAX485 module | Converts UART to RS-485 for VFD communication (shared bus, both VFDs) |
+| ESP32 DevKit V1 | Runs the firmware |
+| Micro-USB cable | Flash firmware + power the ESP32 |
+| MAX485 module | UART ↔ RS-485, shared bus for both VFDs |
+| Female-Female + Female-Male jumper wires | ESP32↔MAX485, MAX485↔VFD `S+`/`S-`/`SG` terminals |
+| Small (M2-size) precision screwdriver | VFD control terminal screws are M2 — a standard driver may slip |
 | VFD1: LS Electric `LSLV0220S100-4EOFNS` (IP20) | Cutter motor drive |
-| VFD2: LS Electric `LSLV0004S100-4EOFNS` | Pump drive |
-| 3-phase induction motor(s) | Load |
-| MCR relay | Input signal source |
-| 6.8kΩ + 1kΩ resistors | Voltage divider for MCR input |
+| VFD2: LS Electric `LSLV0004S100-4EOFNS` (IP20) | Pump drive |
+| Circuit breakers (`ABS103c` 100A, `ABS33c` 5A) | Branch protection, one per VFD |
+| **Real 480V 3-phase power source** (generator or equivalent) | **Hard dependency** — VFDs have no control power without it; nothing above this line does anything until it's connected |
+| 3-phase induction motor(s) | Only needed to actually spin something — not required to test Modbus communication itself |
+| MCR relay + 6.8kΩ/1kΩ divider resistors | Real MCR signal input — not needed for the communication test, only the full auto-sequencing panel |
